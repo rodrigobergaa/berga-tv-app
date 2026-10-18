@@ -1321,6 +1321,7 @@ const S = {
   active: LS.get("active", null),
   favs: LS.get("favs", {}),
   prog: LS.get("prog", {}),
+  hist: LS.get("hist", {}),
   cfg: Object.assign({ ua: "", fmt: "auto", hideAdult: false, favF: "Fran", favB: "Berga", pcAddr: "" }, LS.get("cfg", {})),
   favTab: LS.get("favTab", "b"),
   items: { live: [], movie: [], series: [] },
@@ -1970,6 +1971,30 @@ function shortEpg(it) {
     }
   });
 }
+function histList() {
+  const id = S.src && S.src.id;
+  return id ? S.hist[id] || (S.hist[id] = []) : [];
+}
+function histAdd(it) {
+  if (!it || !S.src) return;
+  const h = histList(), i = h.indexOf(it.k);
+  if (i === 0) return;
+  if (i > 0) h.splice(i, 1);
+  h.unshift(it.k);
+  h.length = Math.min(h.length, 15);
+  LS.set("hist", S.hist);
+  if (S.sel.live === "hist" && S.view === "live" && !S.q) renderItems("live");
+  renderCats("live");
+}
+function histItems() {
+  const m = new Map(S.items.live.map((x) => [x.k, x]));
+  return histList().map((k) => m.get(k)).filter(Boolean);
+}
+function prevChannel() {
+  const h = histItems().filter((x) => x !== S.cur);
+  if (h[0]) playLive(h[0]);
+  else toast("Nenhum canal anterior ainda.");
+}
 const FW = ["f", "b"];
 const favName = (w) => (w === "f" ? S.cfg.favF : S.cfg.favB) || (w === "f" ? "Fran" : "Berga");
 const favL = (w) => favName(w).trim().charAt(0).toUpperCase() || w.toUpperCase();
@@ -2040,6 +2065,7 @@ function itemsOf(t) {
   if (q) return a.filter((i) => (i._n || (i._n = norm(i.name))).includes(q));
   const s = S.sel[t];
   if (s === "*") return a;
+  if (s === "hist") return t === "live" ? histItems().filter((i) => a.includes(i)) : [];
   if (s.slice(0, 4) === "fav:") {
     const b = favBucket(t, s.slice(4));
     return a.filter((i) => b[i.k]);
@@ -2052,7 +2078,7 @@ function renderCats(t) {
   const counts = /* @__PURE__ */ new Map();
   for (const i of S.items[t]) counts.set(i.group, (counts.get(i.group) || 0) + 1);
   const vc = visibleCats(t), tot = vc.length < (S.cat[t] || []).length ? vc.reduce((a, c) => a + (counts.get(c.id) || 0), 0) : S.items[t].length;
-  const rows = [{ id: "*", name: S.q ? "Resultados da busca" : "Todos", n: S.q ? itemsOf(t).length : tot }, ...FW.map((w) => ({ id: "fav:" + w, name: "★ " + favName(w), n: Object.keys(favBucket(t, w)).length })), ...vc.map((c) => __spreadProps(__spreadValues({}, c), { n: counts.get(c.id) || 0 })).filter((c) => c.n > 0)];
+  const rows = [{ id: "*", name: S.q ? "Resultados da busca" : "Todos", n: S.q ? itemsOf(t).length : tot }, ...t === "live" ? [{ id: "hist", name: "🕘 Últimos vistos", n: histItems().length }] : [], ...FW.map((w) => ({ id: "fav:" + w, name: "★ " + favName(w), n: Object.keys(favBucket(t, w)).length })), ...vc.map((c) => __spreadProps(__spreadValues({}, c), { n: counts.get(c.id) || 0 })).filter((c) => c.n > 0)];
   el.innerHTML = rows.map((c) => `<div class="cat${(S.q ? c.id === "*" : S.sel[t] === c.id) ? " on" : ""}" tabindex="0" data-id="${esc(c.id)}"><span>${esc(c.name)}</span><span class="n">${c.n.toLocaleString("pt-BR")}</span></div>`).join("");
 }
 function liveRow(it) {
@@ -2106,15 +2132,15 @@ function renderLiveInfo() {
     return;
   }
   const a = epgOf(it) || [], t = nowS(), cur = a.find((p) => p[0] <= t && t < p[1]), nx = a.filter((p) => p[0] >= (cur ? cur[1] : t) - 1).slice(0, 14);
-  box.innerHTML = `<div class="niTop"><img ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="grow"><div class="niName">${esc(it.name)}</div>${cur ? `<div class="niProg">${esc(cur[2])}</div><div class="niTime">${hhmm(cur[0])} – ${hhmm(cur[1])} · termina em ${Math.max(1, Math.round((cur[1] - t) / 60))} min</div><div class="bar big"><i style="width:${pct(cur)}%"></i></div>` : `<div class="niTime">${S.epg || it._short ? "Sem programação para este canal" : "Guia de programação não carregado"}</div>`}</div><span class="stars" style="font-size:24px">${FW.map((w) => `<button class="star${isFav("live", it, w) ? " on" : ""}" data-a="fav" data-w="${w}" title="Favoritos ${esc(favName(w))}" style="font-size:26px">★<i>${esc(favL(w))}</i></button>`).join("")}</span><button class="btn sm" data-a="golive" title="Pular para o momento atual da transmissão (resolve travadas)">⟳ Ao vivo</button>${S.x && it.arch ? '<button class="btn sm" data-a="arch" title="Assistir programas que já passaram">⏪ Anteriores</button>' : ""}<button class="btn sm" data-a="pip" title="Assistir numa janela flutuante por cima de qualquer programa">⧉ Flutuante</button><button class="btn sm" data-a="fs">⛶ Tela cheia</button></div>${cur && cur[3] ? `<p class="desc">${esc(cur[3])}</p>` : ""}`;
+  box.innerHTML = `<div class="niTop"><img ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="grow"><div class="niName">${esc(it.name)}</div>${cur ? `<div class="niProg">${esc(cur[2])}</div><div class="niTime">${hhmm(cur[0])} – ${hhmm(cur[1])} · termina em ${Math.max(1, Math.round((cur[1] - t) / 60))} min</div><div class="bar big"><i style="width:${pct(cur)}%"></i></div>` : `<div class="niTime">${S.epg || it._short ? "Sem programação para este canal" : "Guia de programação não carregado"}</div>`}</div><span class="stars" style="font-size:24px">${FW.map((w) => `<button class="star${isFav("live", it, w) ? " on" : ""}" data-a="fav" data-w="${w}" title="Favoritos ${esc(favName(w))}" style="font-size:26px">★<i>${esc(favL(w))}</i></button>`).join("")}</span>${histItems().some((x) => x !== it) ? '<button class="btn sm" data-a="prev" title="Voltar ao canal anterior">↩ Anterior</button>' : ""}<button class="btn sm" data-a="golive" title="Pular para o momento atual da transmissão (resolve travadas)">⟳ Ao vivo</button>${S.x && it.arch ? '<button class="btn sm" data-a="arch" title="Assistir programas que já passaram">⏪ Anteriores</button>' : ""}<button class="btn sm" data-a="pip" title="Assistir numa janela flutuante por cima de qualquer programa">⧉ Flutuante</button><button class="btn sm" data-a="fs">⛶ Tela cheia</button></div>${cur && cur[3] ? `<p class="desc">${esc(cur[3])}</p>` : ""}`;
   ep.innerHTML = nx.length ? "<h4>A seguir</h4>" + nx.map((p) => `<div class="ep${recMark(it, p) ? " rec" : ""}" tabindex="0" data-s="${p[0]}"><span class="t">${hhmm(p[0])}</span><span>${esc(p[2])}</span></div>`).join("") : "";
 }
 function renderGuide() {
   const sel = $("#guideCat"), cats = visibleCats("live");
   if (!S.guideCat) S.guideCat = S.sel.live !== "*" && S.sel.live.slice(0, 4) !== "fav:" ? S.sel.live : Object.keys(favBucket("live", "b")).length ? "fav:b" : Object.keys(favBucket("live", "f")).length ? "fav:f" : cats[0] && cats[0].id || "fav:b";
-  sel.innerHTML = FW.map((w) => `<option value="fav:${w}">★ ${esc(favName(w))}</option>`).join("") + cats.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+  sel.innerHTML = '<option value="hist">🕘 Últimos vistos</option>' + FW.map((w) => `<option value="fav:${w}">★ ${esc(favName(w))}</option>`).join("") + cats.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
   sel.value = S.guideCat;
-  let chs = S.guideCat.slice(0, 4) === "fav:" ? S.items.live.filter((i) => isFav("live", i, S.guideCat.slice(4))) : S.items.live.filter((i) => i.group === S.guideCat);
+  let chs = S.guideCat === "hist" ? histItems() : S.guideCat.slice(0, 4) === "fav:" ? S.items.live.filter((i) => isFav("live", i, S.guideCat.slice(4))) : S.items.live.filter((i) => i.group === S.guideCat);
   const total = chs.length;
   chs = chs.slice(0, 250);
   $("#guideNote").textContent = (S.epg ? "" : "Guia de programação ainda não carregado. ") + (total > 250 ? `Mostrando 250 de ${total} canais.` : "");
@@ -2536,6 +2562,7 @@ let zapT;
 function playLive(it, delay) {
   S.cur = it;
   S.liveOn = true;
+  histAdd(it);
   document.querySelectorAll("#liveList .ch").forEach((e) => {
     const on = e._it === it;
     e.classList.toggle("on", on);
@@ -3022,6 +3049,7 @@ $("#liveInfo").onclick = (e) => {
   if (a === "fav") toggleFav("live", S.cur, b.dataset.w);
   else if (a === "pip") pip();
   else if (a === "golive") goLive();
+  else if (a === "prev") prevChannel();
   else if (a === "arch") openArchive(S.cur);
   else liveFull();
 };
@@ -3242,6 +3270,7 @@ document.addEventListener("keydown", (e) => {
       return;
     }
     if (e.key === "f" || e.key === "F") liveFull();
+    if (e.key === "Backspace" || e.key === "r" || e.key === "R") prevChannel();
   }
 });
 setInterval(() => {
@@ -3291,7 +3320,12 @@ window.onNativeClosed = function(j) {
   });
   LS.set("prog", S.prog);
   if (j && j.mode === "live" && j.k) {
+    (j.visited || []).forEach((k) => {
+      const v = S.items.live.find((x) => x.k === k);
+      if (v) histAdd(v);
+    });
     const it = S.items.live.find((x) => x.k === j.k);
+    if (it) histAdd(it);
     if (it && it !== S.cur) {
       S.cur = it;
       renderLiveInfo();

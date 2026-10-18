@@ -1,1 +1,1 @@
-Favoritos Fran e Berga, botão Ao vivo, programas anteriores (catch-up) e gravações pelo computador.
+Histórico dos últimos 15 canais e botão Anterior. Inclui favoritos Fran/Berga, Ao vivo, programas anteriores e gravações.
