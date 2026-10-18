@@ -1,1 +1,1 @@
-Novo: app para TV LG (webOS), arquivo BergaTV.ipk.
+Teclado na tela para a TV LG.

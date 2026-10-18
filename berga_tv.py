@@ -910,6 +910,17 @@ nav button.on .badge{background:#fff;color:var(--ac)}
 .tv .ch:focus,.tv .cat:focus,.tv .epi:focus,.tv .gRow:focus .gName{background:rgba(255,90,31,.22)}
 .android .search input{font-size:16px}
 html.webos #nav [data-view=dl],html.webos #nav [data-view=multi],html.webos [data-a=dl],html.webos .dlb,html.webos [data-a=dlseason],html.webos [data-a=pip],html.webos [data-m=pip]{display:none!important}
+#osk{position:fixed;left:0;right:0;bottom:0;z-index:95;background:var(--bg2);border-top:2px solid var(--ac);padding:14px 18px 18px;box-shadow:0 -10px 40px #000c}
+#osk.hidden{display:none}
+.oskTop{display:flex;align-items:center;margin-bottom:10px}
+.oskLbl{color:var(--tx2);font-size:13px;margin-right:12px;white-space:nowrap}
+.oskVal{flex:1;min-height:44px;background:var(--bg3);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:20px;word-break:break-all;color:var(--tx)}
+.oskVal:after{content:'|';color:var(--ac);margin-left:1px}
+.oskRow{display:flex;justify-content:center;margin-top:6px}
+.oskRow button{min-width:62px;height:50px;margin:0 3px;background:var(--bg4);border:1px solid var(--line);border-radius:8px;font-size:19px;color:var(--tx)}
+.oskRow button.w2{min-width:130px}.oskRow button.w4{min-width:300px}
+.oskRow button.ok{background:var(--ac);border-color:var(--ac);color:#fff}
+.oskRow button:focus{outline:3px solid #fff!important;background:var(--ac);color:#fff}
 @media (max-width:900px){
  .top{height:auto;flex-wrap:wrap;padding:8px 10px;gap:8px}
  .brand span:last-child{display:none}
@@ -995,6 +1006,7 @@ html.webos #nav [data-view=dl],html.webos #nav [data-view=multi],html.webos [dat
   <div class="vmsg" id="vodMsg"></div>
 </div>
 <div id="mini" class="mini"><div class="miniBar" id="miniBar"><span id="miniName"></span><button data-m="pip" title="Janela flutuante fora do navegador (Picture-in-Picture)">⧉</button><button data-m="back" title="Voltar para o canal">⤢</button><button data-m="close" title="Parar e fechar">✕</button></div><div id="miniSlot"></div></div>
+<div id="osk" class="hidden"></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -2542,7 +2554,7 @@ function openSettings(edit) {
   <div class="tabs">${e ? "" : `<button data-tab="m3u" class="${type === "m3u" ? "on" : ""}">Lista M3U</button><button data-tab="xtream" class="${type === "xtream" ? "on" : ""}">Xtream Codes</button>`}</div>
   <form id="srcForm" data-type="${type}" ${e ? `data-edit="${e.id}"` : ""} autocomplete="off">
     <label>Nome (opcional)<input name="name" value="${esc(e ? e.name : "")}" placeholder="Ex.: Minha lista"></label>
-    <div class="only-m3u"><label>URL da lista M3U<input name="url" value="${esc(e && e.url || "")}" placeholder="http://provedor.com/lista.m3u"></label><label>…ou um arquivo .m3u do computador${e && e.file ? " (já enviado; escolha outro para trocar)" : ""}<input type="file" name="file" accept=".m3u,.m3u8,.txt"></label></div>
+    <div class="only-m3u"><label>URL da lista M3U<input name="url" value="${esc(e && e.url || "")}" placeholder="http://provedor.com/lista.m3u"></label>${WEBOS ? "" : `<label>…ou um arquivo .m3u do computador${e && e.file ? " (já enviado; escolha outro para trocar)" : ""}<input type="file" name="file" accept=".m3u,.m3u8,.txt"></label>`}</div>
     <div class="only-xtream"><label>Servidor (com porta)<input name="server" value="${esc(e && e.server || "")}" placeholder="http://servidor.com:8080"></label><div class="row2"><label>Usuário<input name="user" value="${esc(e && e.user || "")}"></label><label>Senha<input name="pass" type="password" placeholder="${e ? "(manter a atual)" : ""}"></label></div></div>
     <label>URL do guia de programação EPG (opcional)<input name="epg" value="${esc(e && e.epg || "")}" placeholder="Deixe em branco para usar o da lista"></label>
     <div class="mBtns"><button class="btn pri" type="submit">${e ? "Salvar alterações" : "Salvar e carregar"}</button>${e ? '<button class="btn" type="button" data-cancel>Cancelar</button>' : ""}</div>
@@ -2898,6 +2910,10 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   const typing = /^(input|select|textarea)$/i.test(e.target.tagName || ""), vodOpen2 = !$("#vodPlayer").classList.contains("hidden"), modalOpen = !$("#modal").classList.contains("hidden");
+  if (e.key === "Escape" && oskOpen()) {
+    oskClose(false);
+    return;
+  }
   if (e.key === "Escape") {
     if (vodOpen2 && !document.fullscreenElement) {
       closeVod();
@@ -2911,6 +2927,11 @@ document.addEventListener("keydown", (e) => {
       e.target.value = "";
       e.target.dispatchEvent(new Event("input"));
     }
+    return;
+  }
+  if (OSKON && e.key === "Enter" && oskIsText(e.target) && !oskOpen()) {
+    e.preventDefault();
+    oskShow(e.target);
     return;
   }
   if (TV && /^Arrow/.test(e.key) && !(e.target.tagName === "SELECT")) {
@@ -3028,6 +3049,10 @@ window.onNativeClosed = function(j) {
   syncLive();
 };
 window.bergaBack = function() {
+  if (oskOpen()) {
+    oskClose(false);
+    return true;
+  }
   if (document.fullscreenElement) {
     document.exitFullscreen().catch(() => {
     });
@@ -3085,11 +3110,11 @@ window.bergaAppResume = function() {
 };
 function spatial(dir) {
   const cur = document.activeElement && document.activeElement !== document.body ? document.activeElement : null;
-  const root = !$("#modal").classList.contains("hidden") ? $("#modal") : document;
+  const root = oskOpen() ? $("#osk") : !$("#modal").classList.contains("hidden") ? $("#modal") : document;
   const els = [...root.querySelectorAll('button,input,select,[tabindex]:not([tabindex="-1"])')].filter((e) => {
     if (e.disabled || e.offsetParent === null) return false;
     const r = e.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && !e.closest(".hidden") && !(root === document && e.closest("#modal"));
+    return r.width > 0 && r.height > 0 && !e.closest(".hidden") && !(root === document && (e.closest("#modal") || e.closest("#osk")));
   });
   if (!cur || !els.includes(cur)) {
     const f = els.find((e) => e.matches(".ch.on")) || els.find((e) => e.matches("#nav .on")) || els[0];
@@ -3136,6 +3161,79 @@ function spatial(dir) {
 if (TV) document.documentElement.classList.add("tv");
 if (AND) document.documentElement.classList.add("android");
 if (WEBOS) document.documentElement.classList.add("webos");
+const OSKON = WEBOS || TVBROWSER;
+const OSK = { el: null, target: null, shift: false };
+const oskOpen = () => !$("#osk").classList.contains("hidden");
+function oskIsText(e) {
+  return e && e.tagName === "INPUT" && /^(text|password|search|url|email|)$/i.test(e.type || "");
+}
+function oskShow(inp) {
+  OSK.target = inp;
+  OSK.val = inp.value;
+  OSK.shift = false;
+  oskRender();
+  $("#osk").classList.remove("hidden");
+  setTimeout(() => {
+    const b = document.querySelector('#osk button[data-k="a"]') || document.querySelector("#osk button");
+    b && b.focus();
+  }, 30);
+}
+function oskRender() {
+  const sh = OSK.shift, L = (k) => sh && k.length === 1 ? k.toUpperCase() : k;
+  const rows = [["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"], ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"], ["a", "s", "d", "f", "g", "h", "j", "k", "l", "@"], ["z", "x", "c", "v", "b", "n", "m", ".", "-", "_"], ["http://", "https://", ".com", ":", "/", "?", "=", "&"]];
+  const lbl = OSK.target && OSK.target.closest("label") ? OSK.target.closest("label").firstChild.textContent.trim() : OSK.target && OSK.target.placeholder || "Digite";
+  $("#osk").innerHTML = `<div class="oskTop"><span class="oskLbl">${esc(lbl)}</span><div class="oskVal">${esc(OSK.val)}</div></div>` + rows.map((r) => `<div class="oskRow">${r.map((k) => `<button type="button" data-k="${esc(k)}" class="${k.length > 3 ? "w2" : ""}">${esc(L(k))}</button>`).join("")}</div>`).join("") + `<div class="oskRow"><button type="button" data-k="#shift" class="w2">${sh ? "abc" : "ABC"}</button><button type="button" data-k=" " class="w4">espaço</button><button type="button" data-k="#bs" class="w2">⌫ Apagar</button><button type="button" data-k="#clr" class="w2">Limpar</button><button type="button" data-k="#ok" class="w2 ok">✓ OK</button></div>`;
+}
+function oskSetVal() {
+  $("#osk .oskVal").textContent = OSK.val;
+}
+function oskClose(apply) {
+  const t = OSK.target;
+  $("#osk").classList.add("hidden");
+  OSK.target = null;
+  if (t) {
+    if (apply) {
+      t.value = OSK.val;
+      t.dispatchEvent(new Event("input", { bubbles: true }));
+      t.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    try {
+      t.focus({ preventScroll: true });
+    } catch (e) {
+      t.focus();
+    }
+  }
+}
+$("#osk").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  const k = b.dataset.k;
+  if (k === "#ok") return oskClose(true);
+  if (k === "#bs") {
+    OSK.val = OSK.val.slice(0, -1);
+    return oskSetVal();
+  }
+  if (k === "#clr") {
+    OSK.val = "";
+    return oskSetVal();
+  }
+  if (k === "#shift") {
+    OSK.shift = !OSK.shift;
+    const i = [...document.querySelectorAll("#osk button")].indexOf(b);
+    oskRender();
+    const nb = document.querySelectorAll("#osk button")[i];
+    nb && nb.focus();
+    return;
+  }
+  OSK.val += OSK.shift && k.length === 1 ? k.toUpperCase() : k;
+  oskSetVal();
+});
+if (OSKON) document.addEventListener("click", (e) => {
+  if (oskIsText(e.target) && !oskOpen()) {
+    e.preventDefault();
+    oskShow(e.target);
+  }
+}, true);
 const UPD = { manual: false, info: null };
 function appVer() {
   try {
