@@ -1,0 +1,28 @@
+name: Publicar versão
+
+on:
+  push:
+    branches: [main]
+    paths: [BergaTV.apk, versao.txt]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ler versão
+        id: v
+        run: echo "tag=$(head -n1 versao.txt | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.v.outputs.tag }}
+          name: Berga TV ${{ steps.v.outputs.tag }}
+          body_path: novidades.md
+          make_latest: true
+          files: |
+            BergaTV.apk
+            berga_tv.py
