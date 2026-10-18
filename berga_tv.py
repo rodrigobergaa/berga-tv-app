@@ -235,12 +235,23 @@ class Downloads(object):
         old_default = os.path.join(os.path.dirname(default_dl_dir()), "Berga IPTV")
         if self.cfg.get("dir") == old_default and not os.path.isdir(old_default):
             self.cfg["dir"] = default_dl_dir()
+        now = time.time()
         for it in self.items:
             it.pop("speed", None)
+            if it.get("kind") == "rec":
+                if it["status"] in ("gravando", "agendado"):
+                    if now < it.get("end", 0):
+                        it["status"] = "agendado"
+                    elif os.path.exists(it["path"] + ".part"):
+                        self._finish_rec(it, "Gravação interrompida (o app foi fechado)")
+                    else:
+                        it["status"], it["msg"] = "erro", "O computador estava desligado no horário"
+                continue
             if it["status"] in ("baixando", "fila"):
                 it["status"] = "pausado"
                 it["msg"] = "Interrompido ao fechar o app"
         self.save()
+        threading.Thread(target=self._rec_loop, daemon=True).start()
 
     def save(self):
         with self.lock:
@@ -278,10 +289,22 @@ class Downloads(object):
                 url = e.get("url") or ""
                 if not re.match(r"^https?://", url, re.I):
                     continue
-                if any(x["url"] == url and x["status"] != "erro" for x in self.items):
+                rec = e.get("kind") == "rec"
+                if rec:
+                    if any(x.get("k") == e.get("k") and x["status"] != "erro" for x in self.items):
+                        continue
+                    try:
+                        start, end = int(e.get("start")), int(e.get("end"))
+                    except (TypeError, ValueError):
+                        continue
+                    if end <= time.time():
+                        continue
+                elif any(x["url"] == url and x["status"] != "erro" for x in self.items):
                     continue
                 ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1].lower()
-                if not re.match(r"^\.[a-z0-9]{2,4}$", ext):
+                if rec:
+                    ext = ".ts"
+                elif not re.match(r"^\.[a-z0-9]{2,4}$", ext):
                     ext = ".mp4"
                 sub = [safe_name(x, 80) for x in (e.get("folder") or []) if x]
                 d = os.path.join(self.cfg["dir"], *sub)
@@ -295,12 +318,143 @@ class Downloads(object):
                     "id": hashlib.sha1((url + str(time.time())).encode()).hexdigest()[:12],
                     "k": e.get("k") or "", "name": e.get("name") or "", "logo": e.get("logo") or "",
                     "kind": e.get("kind") or "movie", "url": url, "ua": ua or "", "path": path, "ext": ext,
-                    "status": "fila", "done": 0, "total": 0, "msg": "", "added": int(time.time()),
+                    "status": "agendado" if rec else "fila", "done": 0, "total": 0, "msg": "", "added": int(time.time()),
                 })
+                if rec:
+                    self.items[-1].update({"start": start, "end": end, "channel": e.get("channel") or "", "prog": e.get("prog") or ""})
                 added += 1
         self.save()
         self.pump()
         return added
+
+    # ------------------------------------------------------------ gravações
+    def _rec_loop(self):
+        while True:
+            now = time.time()
+            with self.lock:
+                for it in self.items:
+                    if it.get("kind") != "rec" or it["status"] != "agendado":
+                        continue
+                    if now >= it["end"]:
+                        it["status"], it["msg"] = "erro", "O horário passou antes de começar"
+                    elif now >= it["start"] - 60 and it["id"] not in self.workers:
+                        it["status"], it["msg"] = "gravando", ""
+                        t = threading.Thread(target=self._record, args=(it,), daemon=True)
+                        self.workers[it["id"]] = t
+                        t.start()
+            time.sleep(5)
+
+    def _finish_rec(self, it, msg=""):
+        part = it["path"] + ".part"
+        if it.get("fmp4") and it["path"].endswith(".ts"):
+            it["path"], it["ext"] = it["path"][:-3] + ".mp4", ".mp4"
+        if os.path.exists(part) and os.path.getsize(part) > 0:
+            try:
+                os.replace(part, it["path"])
+            except OSError:
+                pass
+            it["status"], it["msg"] = "concluido", msg
+            it["total"] = it["done"] = os.path.getsize(it["path"])
+            it["finished"] = int(time.time())
+        else:
+            it["status"], it["msg"] = "erro", msg or "Nada foi gravado (canal fora do ar?)"
+
+    def _record(self, it):
+        part = it["path"] + ".part"
+        stop_at = it["end"] + 120
+        fails = 0
+        seen = []
+        try:
+            os.makedirs(os.path.dirname(part), exist_ok=True)
+            with open(part, "ab") as f:
+                while it["status"] == "gravando" and time.time() < stop_at:
+                    try:
+                        r = upstream(it["url"], it["ua"], timeout=30)
+                        if r.getcode() >= 400:
+                            raise RuntimeError("o provedor respondeu HTTP %d" % r.getcode())
+                        first = r.read(2048)
+                        if first.lstrip(b"\xef\xbb\xbf \r\n\t").startswith(b"#EXTM3U"):
+                            self._record_hls(it, r.geturl(), (first + r.read()).decode("utf-8", "replace"), f, stop_at, seen)
+                        else:
+                            f.write(first)
+                            self._add_done(it, len(first))
+                            reader = getattr(r, "read1", None) or r.read
+                            while it["status"] == "gravando" and time.time() < stop_at:
+                                chunk = reader(65536)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                self._add_done(it, len(chunk))
+                                if fails:
+                                    fails, it["msg"] = 0, ""
+                        r.close()
+                    except Exception as e:
+                        fails += 1
+                        it["msg"] = "Reconectando… (%s)" % (str(e)[:80] or e.__class__.__name__)
+                    if it["status"] == "gravando" and time.time() < stop_at:
+                        time.sleep(min(15, 2 + fails * 2))
+        except Exception as e:
+            it["msg"] = str(e)
+        finally:
+            with self.lock:
+                self.workers.pop(it["id"], None)
+                if it["status"] in ("gravando",):
+                    self._finish_rec(it)
+                elif it["status"] == "parado":
+                    self._finish_rec(it, "Gravação parada antes do fim")
+            self.save()
+
+    def _add_done(self, it, n):
+        with self.lock:
+            it["done"] += n
+
+    def _record_hls(self, it, url, text, f, stop_at, seen):
+        """Grava uma transmissão HLS juntando os segmentos .ts em um único arquivo."""
+        while it["status"] == "gravando" and time.time() < stop_at:
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):
+                variants = [l for l in lines if not l.startswith("#")]
+                url = urllib.parse.urljoin(url, variants[-1])
+                r = upstream(url, it["ua"], timeout=30)
+                text = r.read().decode("utf-8", "replace")
+                r.close()
+                continue
+            target = 6
+            for l in lines:
+                if l.startswith("#EXT-X-TARGETDURATION:"):
+                    try:
+                        target = max(1, int(float(l.split(":", 1)[1])))
+                    except ValueError:
+                        pass
+            for l in lines:
+                m = re.match(r'#EXT-X-MAP:.*URI="([^"]+)"', l)
+                if m and not it.get("fmp4"):
+                    r = upstream(urllib.parse.urljoin(url, m.group(1)), it["ua"], timeout=30)
+                    data = r.read()
+                    r.close()
+                    f.write(data)
+                    self._add_done(it, len(data))
+                    it["fmp4"] = True
+            for l in lines:
+                if l.startswith("#"):
+                    continue
+                seg = urllib.parse.urljoin(url, l)
+                if seg in seen:
+                    continue
+                seen.append(seg)
+                del seen[:-200]
+                r = upstream(seg, it["ua"], timeout=30)
+                data = r.read()
+                r.close()
+                f.write(data)
+                self._add_done(it, len(data))
+                it["msg"] = ""
+            if "#EXT-X-ENDLIST" in text:
+                return
+            time.sleep(max(1, target / 2.0))
+            r = upstream(url, it["ua"], timeout=30)
+            text = r.read().decode("utf-8", "replace")
+            r.close()
 
     def pump(self):
         with self.lock:
@@ -321,6 +475,13 @@ class Downloads(object):
             it = self.find(did)
             if not it:
                 return False
+            if action == "stop" and it.get("kind") == "rec":
+                if it["status"] == "gravando":
+                    it["status"] = "parado"
+                elif it["status"] == "agendado":
+                    self.items.remove(it)
+                self.save()
+                return True
             if action == "pause" and it["status"] in ("baixando", "fila"):
                 it["status"] = "pausado"
                 it["msg"] = ""
@@ -467,6 +628,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
         if gz:
             self.send_header("Content-Encoding", "gzip")
         for k, v in (extra or {}).items():
@@ -514,6 +676,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._err(502, msg or e.__class__.__name__)
             except Exception:
                 pass
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
 
     def do_POST(self):
         p = urllib.parse.urlsplit(self.path)
@@ -564,6 +734,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
         self.send_header("Content-Type", MIME.get(it["ext"], "application/octet-stream"))
         self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
         self.send_header("Content-Length", str(end - start + 1))
         self.end_headers()
         if self.command == "HEAD":
@@ -743,8 +915,19 @@ main{position:relative;flex:1;min-height:0}
 .bar{height:3px;background:var(--line);border-radius:2px;margin-top:4px;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--ac);width:0}
 .bar.big{height:5px;margin-top:8px}
-.star{background:none;border:0;color:#4b5368;font-size:18px;padding:4px;line-height:1}
-.star:hover{color:#8a92a8}.star.on{color:var(--gold)}
+.star{position:relative;background:none;border:0;color:#3b4254;font-size:23px;padding:2px 2px;line-height:1}
+.star i{position:absolute;left:0;right:0;top:50%;margin-top:-4px;font-size:9.5px;font-style:normal;font-weight:900;color:#c9cfdb;line-height:1;text-align:center;text-shadow:none}
+.star.on i{color:#14161c}
+.star:hover{color:#8a92a8}.star.on{color:var(--gold)}.star[data-w=f].on{color:#ff6fae}
+.stars{display:inline-flex;flex:none}
+.favTabs{display:flex;margin-bottom:6px}.favTabs button{margin-right:8px}
+.gProg{cursor:pointer}.gProg.cu b:before{content:'⏪ ';color:var(--ac2)}.gProg.rec b:before{content:'⏺ ';color:#ff4d4d}
+.gName{cursor:pointer}
+.arcDay{margin:16px 0 6px;color:var(--tx2);font-size:12px;text-transform:uppercase;letter-spacing:.8px}
+.arcRow{display:flex;align-items:center;padding:9px 10px;border-radius:8px;cursor:pointer}
+.arcRow:hover,.arcRow:focus{background:var(--bg3);outline:none}
+.arcRow .t{color:var(--ac2);width:54px;flex:none;font-variant-numeric:tabular-nums}.arcRow .d{color:var(--tx2);font-size:12px;margin-left:auto;padding-left:10px;flex:none}
+.ep{cursor:pointer}.ep.rec span:last-child:before{content:'⏺ ';color:#ff4d4d}
 .sentinel{height:1px;grid-column:1/-1}
 .playerPane{flex:1;min-width:0;display:flex;flex-direction:column;overflow:auto;padding:16px;gap:14px}
 .videoWrap{position:relative;background:#000;border-radius:var(--r);overflow:hidden;aspect-ratio:16/9;flex:none;max-height:62vh}
@@ -774,7 +957,7 @@ main{position:relative;flex:1;min-height:0}
 .poster img{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;object-fit:cover}
 .poster .ph{position:absolute;top:0;right:0;bottom:0;left:0;display:grid;place-items:center;padding:10px;text-align:center;color:var(--tx2);font-size:13px}
 .poster .rate{position:absolute;left:6px;top:6px;background:#000c;border-radius:6px;padding:2px 6px;font-size:11px;color:var(--gold)}
-.poster .star{position:absolute;right:2px;top:2px;text-shadow:0 1px 3px #000}
+.poster .stars{position:absolute;right:2px;top:2px}.poster .star{text-shadow:0 1px 3px #000}
 .poster .pbar{position:absolute;left:0;right:0;bottom:0;margin:0;height:4px;border-radius:0}
 .ctitle{margin-top:7px;font-size:13px;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .guideWrap{flex:1;display:flex;flex-direction:column;min-width:0}
@@ -967,6 +1150,7 @@ html.webos #nav [data-view=dl],html.webos #nav [data-view=multi],html.webos [dat
     <button data-view="series">Séries</button>
     <button data-view="multi">Multitela</button>
     <button data-view="fav">Favoritos</button>
+    <button data-view="rec">Gravações<span class="badge" id="recBadge"></span></button>
     <button data-view="dl">Downloads<span class="badge" id="dlBadge"></span></button>
   </nav>
   <div class="search"><input id="q" placeholder="Buscar canal, filme ou série…" autocomplete="off"></div>
@@ -997,6 +1181,7 @@ html.webos #nav [data-view=dl],html.webos #nav [data-view=multi],html.webos [dat
   </div></section>
   <section id="v-fav" class="view"><div class="favBox" id="favBox"></div></section>
   <section id="v-dl" class="view"><div class="favBox" id="dlBox"></div></section>
+  <section id="v-rec" class="view"><div class="favBox" id="recBox"></div></section>
   <div class="emptyState" id="empty"><div class="emptyCard"><div class="logo">B</div><h2>Bem-vindo ao Berga TV</h2><p class="muted">Adicione sua lista M3U ou seu login Xtream Codes para começar.</p><button class="btn pri" id="emptyAdd">+ Adicionar lista</button></div></div>
 </main>
 <div id="modal" class="modal hidden"><div class="modalCard" id="modalCard"></div></div>
@@ -1005,7 +1190,7 @@ html.webos #nav [data-view=dl],html.webos #nav [data-view=multi],html.webos [dat
   <div class="vodTop"><button class="btn" id="vodClose">← Voltar</button><span id="vodTitle"></span><button class="btn hidden" id="vodNext">Próximo episódio ▸</button></div>
   <div class="vmsg" id="vodMsg"></div>
 </div>
-<div id="mini" class="mini"><div class="miniBar" id="miniBar"><span id="miniName"></span><button data-m="pip" title="Janela flutuante fora do navegador (Picture-in-Picture)">⧉</button><button data-m="back" title="Voltar para o canal">⤢</button><button data-m="close" title="Parar e fechar">✕</button></div><div id="miniSlot"></div></div>
+<div id="mini" class="mini"><div class="miniBar" id="miniBar"><span id="miniName"></span><button data-m="live" title="Voltar ao vivo">⟳</button><button data-m="pip" title="Janela flutuante fora do navegador (Picture-in-Picture)">⧉</button><button data-m="back" title="Voltar para o canal">⤢</button><button data-m="close" title="Parar e fechar">✕</button></div><div id="miniSlot"></div></div>
 <div id="osk" class="hidden"></div>
 <div class="toast" id="toast"></div>
 
@@ -1136,7 +1321,8 @@ const S = {
   active: LS.get("active", null),
   favs: LS.get("favs", {}),
   prog: LS.get("prog", {}),
-  cfg: Object.assign({ ua: "", fmt: "auto", hideAdult: false }, LS.get("cfg", {})),
+  cfg: Object.assign({ ua: "", fmt: "auto", hideAdult: false, favF: "Fran", favB: "Berga", pcAddr: "" }, LS.get("cfg", {})),
+  favTab: LS.get("favTab", "b"),
   items: { live: [], movie: [], series: [] },
   cat: { live: [], movie: [], series: [] },
   sel: { live: "*", movie: "*", series: "*" },
@@ -1356,7 +1542,7 @@ function playStream(_0, _1) {
       });
       h.loadSource(abs);
       h.attachMedia(v);
-      engines.set(v, { destroy: () => h.destroy() });
+      engines.set(v, { destroy: () => h.destroy(), hls: h });
     } else if (kind === "ts" && window.mpegts && mpegts.getFeatureList().mseLivePlayback) {
       let tries = 0;
       const start = () => {
@@ -1487,6 +1673,16 @@ function loadM3U(src) {
     return parseM3U(text, src.id);
   });
 }
+function srvOff(si) {
+  try {
+    const m = String(si.time_now || "").match(/(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)/);
+    if (!m || !si.timestamp_now) return 0;
+    const loc = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1e3;
+    return Math.round((loc - +si.timestamp_now) / 900) * 900;
+  } catch (e) {
+    return 0;
+  }
+}
 function loadXtream(src) {
   return __async(this, null, function* () {
     const x = xctx(src), auth = `username=${enc(x.u)}&password=${enc(x.p)}`;
@@ -1506,7 +1702,7 @@ function loadXtream(src) {
     const sid = src.id, B = x.base, U = enc(x.u), P = enc(x.p), cat = (a) => a.map((c) => ({ id: String(c.category_id), name: c.category_name || "Sem nome" }));
     const live = ls.map((s, i) => {
       var _a;
-      return { k: sid + "|l|" + s.stream_id, name: s.name || "", logo: s.stream_icon || "", group: String((_a = s.category_id) != null ? _a : ""), xid: s.stream_id, epgId: s.epg_channel_id || "", num: s.num || i + 1, url: `${B}/live/${U}/${P}/${s.stream_id}.${ext}` };
+      return { k: sid + "|l|" + s.stream_id, name: s.name || "", logo: s.stream_icon || "", group: String((_a = s.category_id) != null ? _a : ""), xid: s.stream_id, epgId: s.epg_channel_id || "", num: s.num || i + 1, arch: +s.tv_archive ? +s.tv_archive_duration || 1 : 0, url: `${B}/live/${U}/${P}/${s.stream_id}.${ext}` };
     });
     const movie = vs.map((s) => {
       var _a;
@@ -1516,7 +1712,7 @@ function loadXtream(src) {
       var _a;
       return { k: sid + "|s|" + s.series_id, name: s.name || "", logo: s.cover || "", group: String((_a = s.category_id) != null ? _a : ""), xid: s.series_id, rating: s.rating || "", plot: s.plot || "", year: String(s.releaseDate || s.release_date || "").slice(0, 4) };
     });
-    return { live, movie, series, cats: { live: cat(lc), movie: cat(vc), series: cat(sc) }, acct: { status: ui.status, exp: +ui.exp_date || 0, max: ui.max_connections, active: ui.active_cons, fmt: ext }, epg: `${x.base}/xmltv.php?${auth}` };
+    return { live, movie, series, cats: { live: cat(lc), movie: cat(vc), series: cat(sc) }, acct: { status: ui.status, exp: +ui.exp_date || 0, max: ui.max_connections, active: ui.active_cons, fmt: ext, tzOff: srvOff(info.server_info) }, epg: `${x.base}/xmltv.php?${auth}` };
   });
 }
 function loadActive(force) {
@@ -1774,31 +1970,49 @@ function shortEpg(it) {
     }
   });
 }
-function favBucket(t) {
+const FW = ["f", "b"];
+const favName = (w) => (w === "f" ? S.cfg.favF : S.cfg.favB) || (w === "f" ? "Fran" : "Berga");
+const favL = (w) => favName(w).trim().charAt(0).toUpperCase() || w.toUpperCase();
+function favRoot() {
   const id = S.src && S.src.id;
-  if (!id) return {};
-  const b = S.favs[id] || (S.favs[id] = { live: {}, movie: {}, series: {} });
-  return b[t] || (b[t] = {});
+  if (!id) return null;
+  let x = S.favs[id];
+  if (!x) x = S.favs[id] = { f: {}, b: {} };
+  if (x.live || x.movie || x.series) {
+    x = { f: {}, b: { live: x.live || {}, movie: x.movie || {}, series: x.series || {} } };
+    S.favs[id] = x;
+    LS.set("favs", S.favs);
+  }
+  return x;
 }
-const isFav = (t, it) => !!favBucket(t)[it.k];
-function toggleFav(t, it) {
-  const b = favBucket(t);
+function favBucket(t, w) {
+  const x = favRoot();
+  if (!x) return {};
+  const u = x[w || "b"] || (x[w || "b"] = {});
+  return u[t] || (u[t] = {});
+}
+const isFav = (t, it, w) => !!favBucket(t, w)[it.k];
+const starBtns = (t, it) => `<span class="stars">${FW.map((w) => `<button class="star${isFav(t, it, w) ? " on" : ""}" data-w="${w}" title="Favoritos ${esc(favName(w))}">★<i>${esc(favL(w))}</i></button>`).join("")}</span>`;
+const favBtnTxt = (t, it, w) => `${isFav(t, it, w) ? "★" : "☆"} ${favName(w)}`;
+function toggleFav(t, it, w) {
+  w = w || "b";
+  const b = favBucket(t, w);
   if (b[it.k]) delete b[it.k];
   else b[it.k] = snap(it);
   LS.set("favs", S.favs);
   const on = !!b[it.k];
   document.querySelectorAll(".ch,.card").forEach((h) => {
     if (h._it && h._it.k === it.k) {
-      const s = h.querySelector(".star");
+      const s = h.querySelector('.star[data-w="' + w + '"]');
       s && s.classList.toggle("on", on);
     }
   });
   renderCats(t);
-  if (S.sel[t] === "fav" && S.view === t) renderItems(t);
+  if (S.sel[t] === "fav:" + w && S.view === t) renderItems(t);
   if (S.view === "fav") renderFav();
   if (S.cur && S.cur.k === it.k) renderLiveInfo();
-  if (S.view === "guide" && S.guideCat === "fav") renderGuide();
-  toast(on ? "Adicionado aos favoritos" : "Removido dos favoritos");
+  if (S.view === "guide" && S.guideCat === "fav:" + w) renderGuide();
+  toast((on ? "Adicionado aos favoritos " : "Removido dos favoritos ") + "d" + (w === "f" ? "a " : "o ") + favName(w));
   return on;
 }
 function saveProg(force) {
@@ -1826,8 +2040,8 @@ function itemsOf(t) {
   if (q) return a.filter((i) => (i._n || (i._n = norm(i.name))).includes(q));
   const s = S.sel[t];
   if (s === "*") return a;
-  if (s === "fav") {
-    const b = favBucket(t);
+  if (s.slice(0, 4) === "fav:") {
+    const b = favBucket(t, s.slice(4));
     return a.filter((i) => b[i.k]);
   }
   return a.filter((i) => i.group === s);
@@ -1838,7 +2052,7 @@ function renderCats(t) {
   const counts = /* @__PURE__ */ new Map();
   for (const i of S.items[t]) counts.set(i.group, (counts.get(i.group) || 0) + 1);
   const vc = visibleCats(t), tot = vc.length < (S.cat[t] || []).length ? vc.reduce((a, c) => a + (counts.get(c.id) || 0), 0) : S.items[t].length;
-  const rows = [{ id: "*", name: S.q ? "Resultados da busca" : "Todos", n: S.q ? itemsOf(t).length : tot }, { id: "fav", name: "★ Favoritos", n: Object.keys(favBucket(t)).length }, ...vc.map((c) => __spreadProps(__spreadValues({}, c), { n: counts.get(c.id) || 0 })).filter((c) => c.n > 0)];
+  const rows = [{ id: "*", name: S.q ? "Resultados da busca" : "Todos", n: S.q ? itemsOf(t).length : tot }, ...FW.map((w) => ({ id: "fav:" + w, name: "★ " + favName(w), n: Object.keys(favBucket(t, w)).length })), ...vc.map((c) => __spreadProps(__spreadValues({}, c), { n: counts.get(c.id) || 0 })).filter((c) => c.n > 0)];
   el.innerHTML = rows.map((c) => `<div class="cat${(S.q ? c.id === "*" : S.sel[t] === c.id) ? " on" : ""}" tabindex="0" data-id="${esc(c.id)}"><span>${esc(c.name)}</span><span class="n">${c.n.toLocaleString("pt-BR")}</span></div>`).join("");
 }
 function liveRow(it) {
@@ -1846,7 +2060,7 @@ function liveRow(it) {
   d.className = "ch" + (S.cur && S.cur.k === it.k ? " on" : "");
   d.tabIndex = 0;
   d._it = it;
-  d.innerHTML = `<span class="num">${esc(it.num)}</span><img class="chlogo" loading="lazy" ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="chtxt"><div class="chname">${esc(it.name)}</div><div class="chnow"></div><div class="bar"><i></i></div></div><button class="star${isFav("live", it) ? " on" : ""}" title="Favoritar">★</button>`;
+  d.innerHTML = `<span class="num">${esc(it.num)}</span><img class="chlogo" loading="lazy" ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="chtxt"><div class="chname">${esc(it.name)}</div><div class="chnow"></div><div class="bar"><i></i></div></div>${starBtns("live", it)}`;
   updNow(d);
   return d;
 }
@@ -1868,7 +2082,7 @@ function card(t, it) {
   d._t = t;
   const pr = S.prog[it.k];
   const r = parseFloat(it.rating);
-  d.innerHTML = `<div class="poster"><div class="ph">${esc(it.name)}</div>${it.logo ? `<img loading="lazy" src="${esc(it.logo)}" alt="">` : ""}${r > 0 ? `<span class="rate">★ ${r.toFixed(1)}</span>` : ""}<button class="star${t !== "cont" && isFav(t, it) ? " on" : ""}" title="${t === "cont" ? "Remover de Continuar assistindo" : "Favoritar"}">${t === "cont" ? "✕" : "★"}</button>${pr && pr.d ? `<div class="bar pbar"><i style="width:${Math.min(100, pr.t / pr.d * 100)}%"></i></div>` : ""}</div><div class="ctitle">${esc(it.name)}</div>`;
+  d.innerHTML = `<div class="poster"><div class="ph">${esc(it.name)}</div>${it.logo ? `<img loading="lazy" src="${esc(it.logo)}" alt="">` : ""}${r > 0 ? `<span class="rate">★ ${r.toFixed(1)}</span>` : ""}${t === "cont" ? '<span class="stars"><button class="star" title="Remover de Continuar assistindo">✕</button></span>' : starBtns(t, it)}${pr && pr.d ? `<div class="bar pbar"><i style="width:${Math.min(100, pr.t / pr.d * 100)}%"></i></div>` : ""}</div><div class="ctitle">${esc(it.name)}</div>`;
   return d;
 }
 function renderItems(t) {
@@ -1892,15 +2106,15 @@ function renderLiveInfo() {
     return;
   }
   const a = epgOf(it) || [], t = nowS(), cur = a.find((p) => p[0] <= t && t < p[1]), nx = a.filter((p) => p[0] >= (cur ? cur[1] : t) - 1).slice(0, 14);
-  box.innerHTML = `<div class="niTop"><img ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="grow"><div class="niName">${esc(it.name)}</div>${cur ? `<div class="niProg">${esc(cur[2])}</div><div class="niTime">${hhmm(cur[0])} – ${hhmm(cur[1])} · termina em ${Math.max(1, Math.round((cur[1] - t) / 60))} min</div><div class="bar big"><i style="width:${pct(cur)}%"></i></div>` : `<div class="niTime">${S.epg || it._short ? "Sem programação para este canal" : "Guia de programação não carregado"}</div>`}</div><button class="star${isFav("live", it) ? " on" : ""}" data-a="fav" title="Favoritar" style="font-size:24px">★</button><button class="btn sm" data-a="pip" title="Assistir numa janela flutuante por cima de qualquer programa">⧉ Flutuante</button><button class="btn sm" data-a="fs">⛶ Tela cheia</button></div>${cur && cur[3] ? `<p class="desc">${esc(cur[3])}</p>` : ""}`;
-  ep.innerHTML = nx.length ? "<h4>A seguir</h4>" + nx.map((p) => `<div class="ep"><span class="t">${hhmm(p[0])}</span><span>${esc(p[2])}</span></div>`).join("") : "";
+  box.innerHTML = `<div class="niTop"><img ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="grow"><div class="niName">${esc(it.name)}</div>${cur ? `<div class="niProg">${esc(cur[2])}</div><div class="niTime">${hhmm(cur[0])} – ${hhmm(cur[1])} · termina em ${Math.max(1, Math.round((cur[1] - t) / 60))} min</div><div class="bar big"><i style="width:${pct(cur)}%"></i></div>` : `<div class="niTime">${S.epg || it._short ? "Sem programação para este canal" : "Guia de programação não carregado"}</div>`}</div><span class="stars" style="font-size:24px">${FW.map((w) => `<button class="star${isFav("live", it, w) ? " on" : ""}" data-a="fav" data-w="${w}" title="Favoritos ${esc(favName(w))}" style="font-size:26px">★<i>${esc(favL(w))}</i></button>`).join("")}</span><button class="btn sm" data-a="golive" title="Pular para o momento atual da transmissão (resolve travadas)">⟳ Ao vivo</button>${S.x && it.arch ? '<button class="btn sm" data-a="arch" title="Assistir programas que já passaram">⏪ Anteriores</button>' : ""}<button class="btn sm" data-a="pip" title="Assistir numa janela flutuante por cima de qualquer programa">⧉ Flutuante</button><button class="btn sm" data-a="fs">⛶ Tela cheia</button></div>${cur && cur[3] ? `<p class="desc">${esc(cur[3])}</p>` : ""}`;
+  ep.innerHTML = nx.length ? "<h4>A seguir</h4>" + nx.map((p) => `<div class="ep${recMark(it, p) ? " rec" : ""}" tabindex="0" data-s="${p[0]}"><span class="t">${hhmm(p[0])}</span><span>${esc(p[2])}</span></div>`).join("") : "";
 }
 function renderGuide() {
   const sel = $("#guideCat"), cats = visibleCats("live");
-  if (!S.guideCat) S.guideCat = S.sel.live !== "*" && S.sel.live !== "fav" ? S.sel.live : Object.keys(favBucket("live")).length ? "fav" : cats[0] && cats[0].id || "fav";
-  sel.innerHTML = `<option value="fav">★ Favoritos</option>` + cats.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
+  if (!S.guideCat) S.guideCat = S.sel.live !== "*" && S.sel.live.slice(0, 4) !== "fav:" ? S.sel.live : Object.keys(favBucket("live", "b")).length ? "fav:b" : Object.keys(favBucket("live", "f")).length ? "fav:f" : cats[0] && cats[0].id || "fav:b";
+  sel.innerHTML = FW.map((w) => `<option value="fav:${w}">★ ${esc(favName(w))}</option>`).join("") + cats.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("");
   sel.value = S.guideCat;
-  let chs = S.guideCat === "fav" ? S.items.live.filter((i) => isFav("live", i)) : S.items.live.filter((i) => i.group === S.guideCat);
+  let chs = S.guideCat.slice(0, 4) === "fav:" ? S.items.live.filter((i) => isFav("live", i, S.guideCat.slice(4))) : S.items.live.filter((i) => i.group === S.guideCat);
   const total = chs.length;
   chs = chs.slice(0, 250);
   $("#guideNote").textContent = (S.epg ? "" : "Guia de programação ainda não carregado. ") + (total > 250 ? `Mostrando 250 de ${total} canais.` : "");
@@ -1910,11 +2124,11 @@ function renderGuide() {
   h += "</div></div>";
   chs.forEach((it, ri) => {
     const a = (epgOf(it) || []).filter((p) => p[1] > t0 && p[0] < t1);
-    h += `<div class="gRow" tabindex="0" data-i="${ri}"><div class="gName"><img ${it.logo ? `src="${esc(it.logo)}"` : ""} alt="" loading="lazy"><span>${esc(it.name)}</span></div><div class="gTrack" style="width:${W}px">`;
+    h += `<div class="gRow" data-i="${ri}"><div class="gName" tabindex="0"><img ${it.logo ? `src="${esc(it.logo)}"` : ""} alt="" loading="lazy"><span>${esc(it.name)}</span></div><div class="gTrack" style="width:${W}px">`;
     if (!a.length) h += `<div class="gProg empty" style="left:4px;width:${W - 8}px">Sem informação de programação</div>`;
     for (const p of a) {
-      const l = Math.max(0, (p[0] - t0) / 60 * PX), r = Math.min(W, (p[1] - t0) / 60 * PX);
-      h += `<div class="gProg${p[0] <= nt && nt < p[1] ? " live" : ""}" style="left:${l + 1}px;width:${Math.max(0, r - l - 3)}px" title="${esc(hhmm(p[0]) + " – " + hhmm(p[1]) + "  " + p[2] + (p[3] ? "\n\n" + p[3] : ""))}"><b>${esc(p[2])}</b><small>${hhmm(p[0])} – ${hhmm(p[1])}</small></div>`;
+      const l = Math.max(0, (p[0] - t0) / 60 * PX), r = Math.min(W, (p[1] - t0) / 60 * PX), cls = (p[0] <= nt && nt < p[1] ? " live" : "") + (p[1] <= nt && S.x && it.arch ? " cu" : "") + (recMark(it, p) ? " rec" : "");
+      h += `<div class="gProg${cls}" tabindex="0" data-s="${p[0]}" style="left:${l + 1}px;width:${Math.max(0, r - l - 3)}px" title="${esc(hhmm(p[0]) + " – " + hhmm(p[1]) + "  " + p[2] + (p[3] ? "\n\n" + p[3] : ""))}"><b>${esc(p[2])}</b><small>${hhmm(p[0])} – ${hhmm(p[1])}</small></div>`;
     }
     h += "</div></div>";
   });
@@ -1940,14 +2154,25 @@ function renderFav() {
     items.forEach((i) => g.appendChild(make(i)));
     box.appendChild(g);
   };
+  const w = S.favTab === "f" ? "f" : "b", tabs = document.createElement("div");
+  tabs.className = "favTabs";
+  tabs.innerHTML = FW.map((x) => `<button class="btn${x === w ? " pri" : ""}" data-ft="${x}">★ Favoritos ${esc(favName(x))}</button>`).join("");
+  box.appendChild(tabs);
   sec("Continuar assistindo", cont, (it) => {
     const c = card("cont", it);
     return c;
   }, "grid");
-  sec("Canais favoritos", f(Object.values(favBucket("live"))), liveRow, "chips");
-  sec("Filmes favoritos", f(Object.values(favBucket("movie"))), (it) => card("movie", it), "grid");
-  sec("Séries favoritas", f(Object.values(favBucket("series"))), (it) => card("series", it), "grid");
-  if (!box.children.length) box.innerHTML = '<p class="muted">Nada por aqui ainda. Toque na ★ de um canal, filme ou série para salvar nos favoritos.</p>';
+  const n0 = box.children.length;
+  sec("Canais", f(Object.values(favBucket("live", w))), liveRow, "chips");
+  sec("Filmes", f(Object.values(favBucket("movie", w))), (it) => card("movie", it), "grid");
+  sec("Séries", f(Object.values(favBucket("series", w))), (it) => card("series", it), "grid");
+  if (box.children.length === n0) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.style.marginTop = "16px";
+    p.innerHTML = `Nada nos favoritos d${w === "f" ? "a" : "o"} ${esc(favName(w))} ainda. Toque na estrela com <b>${esc(favL(w))}</b> de um canal, filme ou série.`;
+    box.appendChild(p);
+  }
 }
 function renderAll() {
   ["live", "movie", "series"].forEach((t) => {
@@ -1974,6 +2199,10 @@ function setView(v) {
   if (v === "dl") {
     renderDl(true);
     dlFetch();
+  }
+  if (v === "rec") {
+    renderRec(true);
+    recFetch();
   }
 }
 const vodOpen = () => !$("#vodPlayer").classList.contains("hidden");
@@ -2064,7 +2293,8 @@ function pip() {
     const b = e.target.closest("[data-m]");
     if (!b) return;
     const a = b.dataset.m;
-    if (a === "back") setView("live");
+    if (a === "live") goLive();
+    else if (a === "back") setView("live");
     else if (a === "pip") pip();
     else {
       S.liveOn = false;
@@ -2153,11 +2383,11 @@ function mvStop() {
 function mvPick(i) {
   S.modalFor = "mvpick";
   const cats = visibleCats("live");
-  modal(`<button class="mx" data-close>✕</button><h2>Escolher canal · quadro ${i + 1}</h2><div class="row2" style="margin:14px 0 10px"><input id="pkQ" class="pkIn" placeholder="Buscar canal…" autocomplete="off"><select id="pkCat" class="pkIn"><option value="*">Todas as categorias</option><option value="fav">★ Favoritos</option>${cats.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("")}</select></div><div id="pkList" class="pkList"></div>`);
+  modal(`<button class="mx" data-close>✕</button><h2>Escolher canal · quadro ${i + 1}</h2><div class="row2" style="margin:14px 0 10px"><input id="pkQ" class="pkIn" placeholder="Buscar canal…" autocomplete="off"><select id="pkCat" class="pkIn"><option value="*">Todas as categorias</option>${FW.map((w) => `<option value="fav:${w}">★ ${esc(favName(w))}</option>`).join("")}${cats.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join("")}</select></div><div id="pkList" class="pkList"></div>`);
   const draw = () => {
     const q = norm($("#pkQ").value), c = $("#pkCat").value;
     let a = S.items.live;
-    if (c === "fav") a = a.filter((x) => isFav("live", x));
+    if (c.slice(0, 4) === "fav:") a = a.filter((x) => isFav("live", x, c.slice(4)));
     else if (c !== "*") a = a.filter((x) => x.group === c);
     if (q) a = a.filter((x) => (x._n || (x._n = norm(x.name))).includes(q));
     const box = $("#pkList");
@@ -2251,7 +2481,7 @@ function dlAdd(items) {
   });
 }
 function dlBadge() {
-  const n = DLS.items.filter((x) => x.status === "baixando" || x.status === "fila").length;
+  const n = DLS.items.filter((x) => x.kind !== "rec" && (x.status === "baixando" || x.status === "fila")).length;
   const b = $("#dlBadge");
   b.textContent = n;
   b.style.display = n ? "inline-block" : "none";
@@ -2274,7 +2504,7 @@ function dlBtns(d) {
 }
 function renderDl(force) {
   const box = $("#dlBox");
-  const act = DLS.items.filter((x) => x.status !== "concluido"), done = DLS.items.filter((x) => x.status === "concluido").sort((a, b) => (b.finished || 0) - (a.finished || 0));
+  const its = DLS.items.filter((x) => x.kind !== "rec"), act = its.filter((x) => x.status !== "concluido"), done = its.filter((x) => x.status === "concluido").sort((a, b) => (b.finished || 0) - (a.finished || 0));
   const sig = DLS.ok + "|" + DLS.dir + "|" + DLS.max + "|" + [...act, ...done].map((x) => x.id + x.status + (x.exists ? 1 : 0)).join(",");
   if (!force && sig === DLS.sig) {
     act.forEach((d) => {
@@ -2337,7 +2567,7 @@ function openMovie(it) {
     let inf = {};
     const draw = () => {
       const r = parseFloat(it.rating);
-      modal(`<button class="mx" data-close>✕</button>${inf.backdrop ? '<div class="mBack"></div>' : ""}<div class="mHead"><img class="mPoster" ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="mMeta"><h2>${esc(inf.name || it.name)}</h2><div class="tags">${[inf.year, inf.genre, inf.duration, r > 0 ? "★ " + r.toFixed(1) : ""].filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("")}</div><p>${esc(inf.plot || (S.x ? "Carregando detalhes…" : ""))}</p>${inf.cast ? `<p class="muted small"><b>Elenco:</b> ${esc(inf.cast)}</p>` : ""}${inf.director ? `<p class="muted small"><b>Direção:</b> ${esc(inf.director)}</p>` : ""}<div class="mBtns">${pr && pr.t > 20 ? `<button class="btn pri" data-a="resume">▶ Continuar de ${fmtDur(pr.t)}</button><button class="btn" data-a="play">Do início</button>` : `<button class="btn pri" data-a="play">▶ Assistir</button>`}<button class="btn" data-a="fav">${isFav("movie", it) ? "★ Nos favoritos" : "☆ Favoritar"}</button><button class="btn" data-a="dl">${dlLabel(it.k, true)}</button></div>${dlDone(it.k) ? '<p class="muted small" style="margin-top:10px">✓ Baixado no computador: o play usa o arquivo, sem gastar conexão nem internet.</p>' : ""}</div></div>`);
+      modal(`<button class="mx" data-close>✕</button>${inf.backdrop ? '<div class="mBack"></div>' : ""}<div class="mHead"><img class="mPoster" ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="mMeta"><h2>${esc(inf.name || it.name)}</h2><div class="tags">${[inf.year, inf.genre, inf.duration, r > 0 ? "★ " + r.toFixed(1) : ""].filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("")}</div><p>${esc(inf.plot || (S.x ? "Carregando detalhes…" : ""))}</p>${inf.cast ? `<p class="muted small"><b>Elenco:</b> ${esc(inf.cast)}</p>` : ""}${inf.director ? `<p class="muted small"><b>Direção:</b> ${esc(inf.director)}</p>` : ""}<div class="mBtns">${pr && pr.t > 20 ? `<button class="btn pri" data-a="resume">▶ Continuar de ${fmtDur(pr.t)}</button><button class="btn" data-a="play">Do início</button>` : `<button class="btn pri" data-a="play">▶ Assistir</button>`}${FW.map((w) => `<button class="btn" data-a="fav" data-w="${w}">${esc(favBtnTxt("movie", it, w))}</button>`).join("")}<button class="btn" data-a="dl">${dlLabel(it.k, true)}</button></div>${dlDone(it.k) ? '<p class="muted small" style="margin-top:10px">✓ Baixado no computador: o play usa o arquivo, sem gastar conexão nem internet.</p>' : ""}</div></div>`);
       if (inf.backdrop) {
         const b = $(".mBack");
         b && b.style.setProperty("--bd", `url("${String(inf.backdrop).replace(/"/g, "%22")}")`);
@@ -2352,8 +2582,8 @@ function openMovie(it) {
         closeModal();
         playVod(it, { start: a === "resume" ? pr.t : 0 });
       } else if (a === "fav") {
-        const on = toggleFav("movie", it);
-        b.textContent = on ? "★ Nos favoritos" : "☆ Favoritar";
+        toggleFav("movie", it, b.dataset.w);
+        b.textContent = favBtnTxt("movie", it, b.dataset.w);
       } else if (a === "dl") {
         const d = dlOf(it.k);
         if (d) {
@@ -2382,7 +2612,7 @@ function openSeries(it) {
     S.modalFor = it;
     let seasons = null, info = { plot: it.plot, year: it.year }, cur = null, err = "";
     const draw = () => {
-      const head = `<button class="mx" data-close>✕</button>${info.backdrop ? '<div class="mBack"></div>' : ""}<div class="mHead"><img class="mPoster" ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="mMeta"><h2>${esc(it.name)}</h2><div class="tags">${[info.year, info.genre, parseFloat(it.rating) > 0 ? "★ " + parseFloat(it.rating).toFixed(1) : ""].filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("")}</div><p>${esc(info.plot || "")}</p>${info.cast ? `<p class="muted small"><b>Elenco:</b> ${esc(info.cast)}</p>` : ""}<div class="mBtns"><button class="btn" data-a="fav">${isFav("series", it) ? "★ Nos favoritos" : "☆ Favoritar"}</button></div></div></div>`;
+      const head = `<button class="mx" data-close>✕</button>${info.backdrop ? '<div class="mBack"></div>' : ""}<div class="mHead"><img class="mPoster" ${it.logo ? `src="${esc(it.logo)}"` : ""} alt=""><div class="mMeta"><h2>${esc(it.name)}</h2><div class="tags">${[info.year, info.genre, parseFloat(it.rating) > 0 ? "★ " + parseFloat(it.rating).toFixed(1) : ""].filter(Boolean).map((x) => `<span>${esc(x)}</span>`).join("")}</div><p>${esc(info.plot || "")}</p>${info.cast ? `<p class="muted small"><b>Elenco:</b> ${esc(info.cast)}</p>` : ""}<div class="mBtns">${FW.map((w) => `<button class="btn" data-a="fav" data-w="${w}">${esc(favBtnTxt("series", it, w))}</button>`).join("")}</div></div></div>`;
       let body = "";
       if (!seasons) body = `<p class="muted">${err ? "Não foi possível carregar os episódios: " + esc(err) : "Carregando episódios…"}</p>`;
       else if (!seasons.size) body = '<p class="muted">Nenhum episódio disponível.</p>';
@@ -2418,8 +2648,8 @@ function openSeries(it) {
       }
       const fb = e.target.closest('[data-a="fav"]');
       if (fb) {
-        const on = toggleFav("series", it);
-        fb.textContent = on ? "★ Nos favoritos" : "☆ Favoritar";
+        toggleFav("series", it, fb.dataset.w);
+        fb.textContent = favBtnTxt("series", it, fb.dataset.w);
         return;
       }
       const pad = (n) => String(n).padStart(2, "0"), epDl = (x) => ({ k: x.k, name: label(x), url: x.url, logo: it.logo, kind: "series", folder: ["Séries", it.name, "Temporada " + x.s], filename: `${it.name} - T${pad(x.s)}E${pad(x.e)}${x.title && !/^Episódio \d+$/.test(x.title) && x.title !== it.name ? " - " + x.title : ""}` });
@@ -2566,6 +2796,8 @@ function openSettings(edit) {
     <div class="row2"><label>Formato dos canais ao vivo (Xtream)<select name="fmt"><option value="auto">Automático</option><option value="m3u8">HLS (.m3u8)</option><option value="ts">MPEG-TS (.ts)</option></select></label>
     <label>User-Agent enviado ao provedor<input name="ua" value="${esc(S.cfg.ua)}" placeholder="Padrão: VLC"></label></div>
     ${AND || WEBOS ? "" : `<div class="row2"><label>Pasta dos downloads<input name="dldir" value="${esc(DLS.dir)}"></label><label>Downloads ao mesmo tempo<select name="dlmax">${[1, 2, 3, 4].map((n) => `<option value="${n}" ${+DLS.max === n ? "selected" : ""}>${n}</option>`).join("")}</select></label></div>`}
+    <div class="row2"><label>Nome dos favoritos 1 (estrela rosa)<input name="favF" value="${esc(S.cfg.favF)}"></label><label>Nome dos favoritos 2 (estrela amarela)<input name="favB" value="${esc(S.cfg.favB)}"></label></div>
+    ${AND || WEBOS ? `<label>Computador que grava os programas (endereço do Berga TV no PC, ex.: 192.168.1.24:8765)<input name="pcAddr" value="${esc(S.cfg.pcAddr)}" placeholder="Abra o atalho Berga TV (rede Wi-Fi) no PC e copie o endereço"></label>` : ""}
     <label class="chk"><input type="checkbox" name="hideAdult" ${S.cfg.hideAdult ? "checked" : ""}> Ocultar categorias adultas</label>
     <div class="mBtns"><button class="btn" type="submit">Salvar preferências</button><button class="btn" type="button" data-epg>Recarregar guia (EPG)</button></div>
   </form>
@@ -2655,7 +2887,8 @@ function openSettings(edit) {
     const f = ev.target;
     if (f.id === "cfgForm") {
       const old2 = S.cfg.fmt;
-      S.cfg = { ua: f.ua.value.trim(), fmt: f.fmt.value, hideAdult: f.hideAdult.checked };
+      S.cfg = { ua: f.ua.value.trim(), fmt: f.fmt.value, hideAdult: f.hideAdult.checked, favF: f.favF.value.trim() || "Fran", favB: f.favB.value.trim() || "Berga", pcAddr: f.pcAddr ? normPc(f.pcAddr.value) : S.cfg.pcAddr };
+      REC.sig = "";
       LS.set("cfg", S.cfg);
       const dd = f.dldir ? f.dldir.value.trim() : "", dm = f.dlmax ? +f.dlmax.value : +DLS.max;
       if (!AND && (dd && dd !== DLS.dir) || dm !== +DLS.max) {
@@ -2735,7 +2968,8 @@ $("#modal").addEventListener("click", (e) => {
 $("#liveList").onclick = (e) => {
   const r = e.target.closest(".ch");
   if (!r) return;
-  if (e.target.closest(".star")) return toggleFav("live", r._it);
+  const st = e.target.closest(".star");
+  if (st) return toggleFav("live", r._it, st.dataset.w);
   if ((AND || TV) && S.cur === r._it && S.liveOn) return liveFull();
   playLive(r._it);
 };
@@ -2743,16 +2977,25 @@ $("#liveList").onclick = (e) => {
   $("#" + t + "Grid").onclick = (e) => {
     const c = e.target.closest(".card");
     if (!c) return;
-    if (e.target.closest(".star")) return toggleFav(t, c._it);
+    const st = e.target.closest(".star");
+    if (st) return toggleFav(t, c._it, st.dataset.w);
     t === "movie" ? openMovie(c._it) : openSeries(c._it);
   };
 });
 $("#favBox").onclick = (e) => {
+  const ft = e.target.closest("[data-ft]");
+  if (ft) {
+    S.favTab = ft.dataset.ft;
+    LS.set("favTab", S.favTab);
+    renderFav();
+    return;
+  }
   const r = e.target.closest(".ch,.card");
   if (!r) return;
   const it = r._it;
+  const st0 = e.target.closest(".star");
   if (r.classList.contains("ch")) {
-    if (e.target.closest(".star")) return toggleFav("live", it);
+    if (st0) return toggleFav("live", it, st0.dataset.w);
     const real = S.items.live.find((i) => i.k === it.k) || it;
     setView("live");
     playLive(real);
@@ -2769,16 +3012,24 @@ $("#favBox").onclick = (e) => {
     playVod(it, { start: pr ? pr.t : 0 });
     return;
   }
-  if (e.target.closest(".star")) return toggleFav(r._t, it);
+  if (st0) return toggleFav(r._t, it, st0.dataset.w);
   r._t === "movie" ? openMovie(it) : openSeries(it);
 };
 $("#liveInfo").onclick = (e) => {
   const b = e.target.closest("[data-a]");
   if (!b || !S.cur) return;
   const a = b.dataset.a;
-  if (a === "fav") toggleFav("live", S.cur);
+  if (a === "fav") toggleFav("live", S.cur, b.dataset.w);
   else if (a === "pip") pip();
+  else if (a === "golive") goLive();
+  else if (a === "arch") openArchive(S.cur);
   else liveFull();
+};
+$("#liveEpg").onclick = (e) => {
+  const r = e.target.closest(".ep");
+  if (!r || !S.cur) return;
+  const a = epgOf(S.cur) || [], p = a.find((x) => x[0] === +r.dataset.s);
+  if (p) progModal(S.cur, p);
 };
 $("#liveVideo").addEventListener("dblclick", (e) => {
   e.preventDefault();
@@ -2793,10 +3044,14 @@ $("#guide").onclick = (e) => {
   const r = e.target.closest(".gRow");
   if (!r) return;
   const it = $("#guide")._chs[+r.dataset.i];
-  if (it) {
-    setView("live");
-    playLive(it);
+  if (!it) return;
+  const pb = e.target.closest(".gProg[data-s]");
+  if (pb) {
+    const p = (epgOf(it) || []).find((x) => x[0] === +pb.dataset.s);
+    if (p) return progModal(it, p);
   }
+  setView("live");
+  playLive(it);
 };
 $("#mvGrid").addEventListener("click", (e) => {
   const c = e.target.closest(".mvCell");
@@ -2959,7 +3214,7 @@ document.addEventListener("keydown", (e) => {
     } else if (e.key === "n" || e.key === "N") nextEp();
     return;
   }
-  if (e.key === "Enter" && e.target.matches(".ch,.card,.cat,.epi,.mvCell,.gRow")) {
+  if (e.key === "Enter" && e.target.matches(".ch,.card,.cat,.epi,.mvCell,.gRow,.gName,.gProg,.ep,.arcRow")) {
     e.preventDefault();
     e.target.click();
     return;
@@ -3161,6 +3416,267 @@ function spatial(dir) {
 if (TV) document.documentElement.classList.add("tv");
 if (AND) document.documentElement.classList.add("android");
 if (WEBOS) document.documentElement.classList.add("webos");
+function goLive() {
+  const v = $("#liveVideo"), e = engines.get(v);
+  if (!S.cur) return;
+  if (e && e.hls && isFinite(e.hls.liveSyncPosition) && e.hls.liveSyncPosition > 0 && v.readyState >= 2) {
+    v.currentTime = e.hls.liveSyncPosition;
+    const pl = v.play();
+    pl && pl.catch && pl.catch(() => {
+    });
+    toast("Ao vivo");
+  } else {
+    S.liveOn = true;
+    startLive(S.cur);
+    placePlayer();
+    toast("Reconectando no ao vivo…");
+  }
+}
+const two = (n) => String(n).padStart(2, "0");
+function cuUrl(it, start, durMin) {
+  const d = new Date((start + (S.acct && S.acct.tzOff || 0)) * 1e3);
+  const ts = `${d.getUTCFullYear()}-${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())}:${two(d.getUTCHours())}-${two(d.getUTCMinutes())}`;
+  return `${S.x.base}/timeshift/${enc(S.x.u)}/${enc(S.x.p)}/${Math.max(1, Math.ceil(durMin))}/${ts}/${it.xid}.ts`;
+}
+const dayLbl = (t) => {
+  const d = new Date(t * 1e3), n = /* @__PURE__ */ new Date(), y = new Date(Date.now() - 864e5);
+  if (d.toDateString() === n.toDateString()) return "Hoje";
+  if (d.toDateString() === y.toDateString()) return "Ontem";
+  return d.toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "2-digit" });
+};
+function playCatchup(it, p) {
+  const dur = (p[1] - p[0]) / 60;
+  playVod({ k: "cu|" + it.k + "|" + p[0], name: `${it.name} · ${p[2]} (${dayLbl(p[0])} ${hhmm(p[0])})`, logo: it.logo, url: cuUrl(it, p[0], dur) });
+}
+function openArchive(it) {
+  return __async(this, null, function* () {
+    S.modalFor = "arch";
+    const draw = (html) => modal(`<button class="mx" data-close>✕</button><h2>⏪ ${esc(it.name)}</h2><p class="muted small">Programas que já passaram e ficam guardados pelo seu provedor por ${it.arch} dia${it.arch > 1 ? "s" : ""}.</p>${html}`);
+    draw('<p class="muted">Carregando programação anterior…</p>');
+    let list = [];
+    try {
+      const j = JSON.parse(yield txt(xapi("get_simple_data_table", "&stream_id=" + it.xid)));
+      const b64 = (s) => {
+        try {
+          return new TextDecoder().decode(Uint8Array.from(atob(s || ""), (c) => c.charCodeAt(0)));
+        } catch (e) {
+          return s || "";
+        }
+      };
+      const nt = nowS(), lim = nt - it.arch * 86400;
+      list = arr(j.epg_listings).map((e) => [+e.start_timestamp, +e.stop_timestamp, b64(e.title), b64(e.description), +e.has_archive]).filter((p) => p[0] && p[1] <= nt && p[0] >= lim && (p[4] || p[4] === 0 ? true : true)).sort((a, b) => b[0] - a[0]);
+    } catch (e) {
+      if (S.modalFor === "arch") draw('<p class="muted">Não consegui carregar: ' + esc(e.message) + "</p>");
+      return;
+    }
+    if (S.modalFor !== "arch") return;
+    if (!list.length) return draw('<p class="muted">O provedor não informou programas anteriores para este canal.</p>');
+    let h = "", lastDay = "";
+    list.forEach((p, i) => {
+      const dl = dayLbl(p[0]);
+      if (dl !== lastDay) {
+        h += `<div class="arcDay">${esc(dl)}</div>`;
+        lastDay = dl;
+      }
+      h += `<div class="arcRow" tabindex="0" data-i="${i}"><span class="t">${hhmm(p[0])}</span><span>${esc(p[2])}</span><span class="d">${Math.round((p[1] - p[0]) / 60)} min</span></div>`;
+    });
+    draw(h);
+    $("#modalCard").onclick = (e) => {
+      const r = e.target.closest(".arcRow");
+      if (!r) return;
+      closeModal();
+      playCatchup(it, list[+r.dataset.i]);
+    };
+    if (TV) setTimeout(() => {
+      const r = document.querySelector(".arcRow");
+      r && r.focus();
+    }, 60);
+  });
+}
+function progModal(it, p) {
+  const nt = nowS(), past = p[1] <= nt, live = p[0] <= nt && nt < p[1], canCu = S.x && it.arch && p[0] >= nt - it.arch * 86400, rb = recBase(), hasRb = rb != null, rm = recMark(it, p);
+  S.modalFor = "prog";
+  const btns = [];
+  if (live) btns.push('<button class="btn pri" data-p="watch">▶ Assistir agora</button>');
+  if (past && canCu) btns.push('<button class="btn pri" data-p="cu">▶ Assistir</button>');
+  if (live && canCu) btns.push('<button class="btn" data-p="cu">⏮ Assistir do início</button>');
+  if (!past) btns.push(rm ? `<button class="btn" data-p="unrec">⏹ Cancelar gravação</button>` : `<button class="btn${live ? "" : " pri"}" data-p="rec">⏺ Gravar${live ? " a partir de agora" : ""}</button>`);
+  if (!live && !past) btns.push('<button class="btn" data-p="watch">Ir para o canal</button>');
+  modal(`<button class="mx" data-close>✕</button><p class="muted small" style="margin:0">${esc(it.name)} · ${esc(dayLbl(p[0]))} ${hhmm(p[0])} – ${hhmm(p[1])}</p><h2 style="margin-top:6px">${esc(p[2] || "Sem título")}</h2>${p[3] ? `<p class="muted">${esc(p[3])}</p>` : ""}${past && !canCu ? '<p class="muted small">Este programa já passou e o canal não tem programas anteriores no seu provedor.</p>' : ""}${!past && !hasRb ? `<p class="muted small">${AND || WEBOS ? "Para gravar, informe em ⚙ Configurações o endereço do computador com o Berga TV aberto pelo atalho “rede Wi-Fi”." : ""}</p>` : ""}<div class="mBtns">${btns.join("")}</div>`);
+  $("#modalCard").onclick = (e) => __async(this, null, function* () {
+    const b = e.target.closest("[data-p]");
+    if (!b) return;
+    const a = b.dataset.p;
+    if (a === "watch") {
+      closeModal();
+      setView("live");
+      playLive(it);
+      return;
+    }
+    if (a === "cu") {
+      closeModal();
+      playCatchup(it, p);
+      return;
+    }
+    if (a === "rec") {
+      if (!hasRb) {
+        toast(AND || WEBOS ? "Informe o endereço do computador em ⚙ Configurações para gravar." : "Gravação indisponível.", true);
+        return;
+      }
+      b.disabled = true;
+      yield recAdd(it, p);
+      closeModal();
+      return;
+    }
+    if (a === "unrec") {
+      const r = REC.items.find((x) => x.k === recKey(it, p));
+      if (r) {
+        try {
+          yield recPost("/dl/act", { id: r.id, act: r.status === "gravando" ? "stop" : "stop" });
+          toast("Gravação cancelada");
+        } catch (err) {
+          toast("Erro: " + err.message, true);
+        }
+        yield recFetch();
+      }
+      closeModal();
+      return;
+    }
+  });
+  if (TV) setTimeout(() => {
+    const b = document.querySelector("#modalCard .mBtns .btn");
+    b && b.focus();
+  }, 60);
+}
+const REC = { items: [], ok: null, sig: "", timer: null };
+function normPc(v) {
+  v = String(v || "").trim().replace(/\/+$/, "");
+  if (!v) return "";
+  if (!/^https?:\/\//i.test(v)) v = "http://" + v;
+  if (!/:\d+$/.test(v.replace(/^https?:\/\//, ""))) v += ":8765";
+  return v;
+}
+function recBase() {
+  if (AND || WEBOS) return S.cfg.pcAddr || null;
+  return location.protocol.indexOf("http") === 0 ? "" : null;
+}
+const recKey = (it, p) => "rec|" + it.k + "|" + p[0];
+const recMark = (it, p) => REC.items.some((x) => x.k === recKey(it, p) && (x.status === "agendado" || x.status === "gravando"));
+function recPost(path, body) {
+  return __async(this, null, function* () {
+    const b = recBase();
+    if (b == null) throw new Error("sem computador configurado");
+    const r = yield fetch(b + path, { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify(body || {}) });
+    const j = yield r.json().catch(() => ({}));
+    if (!r.ok || j.erro) throw new Error(j.erro || "HTTP " + r.status);
+    return j;
+  });
+}
+function recUrl(it) {
+  return S.x ? it.url.replace(/\.m3u8(\?|$)/, ".ts$1") : it.url;
+}
+function recAdd(it, p) {
+  return __async(this, null, function* () {
+    const d = new Date(p[0] * 1e3), nm = `${p[2] || "Programa"} - ${it.name} - ${two(d.getDate())}-${two(d.getMonth() + 1)} ${two(d.getHours())}h${two(d.getMinutes())}`;
+    try {
+      const j = yield recPost("/dl/add", { ua: S.cfg.ua, items: [{ kind: "rec", k: recKey(it, p), name: `${p[2] || "Programa"} · ${it.name}`, channel: it.name, prog: p[2] || "", logo: it.logo || "", url: recUrl(it), start: Math.max(p[0], Math.floor(nowS())), end: p[1], folder: ["Gravações"], filename: nm }] });
+      toast(j.added ? `⏺ Gravação agendada: ${p[2]} (${hhmm(p[0])}). O computador precisa estar ligado com o Berga TV aberto.` : "Essa gravação já estava agendada.");
+      yield recFetch();
+      if (S.view === "guide") renderGuide();
+      renderLiveInfo();
+    } catch (e) {
+      toast("Não consegui agendar no computador: " + e.message + (AND || WEBOS ? " (confira o endereço em ⚙ e se o atalho “rede Wi-Fi” está aberto no PC)" : ""), true);
+    }
+  });
+}
+function recFetch() {
+  return __async(this, null, function* () {
+    const b = recBase();
+    if (b == null) {
+      REC.ok = null;
+      REC.items = [];
+    } else {
+      try {
+        const r = yield fetch(b + "/dl/list", { cache: "no-store" });
+        const j = yield r.json();
+        REC.items = (j.items || []).filter((x) => x.kind === "rec");
+        REC.ok = true;
+      } catch (e) {
+        REC.ok = false;
+      }
+    }
+    const n = REC.items.filter((x) => x.status === "gravando").length, bd = $("#recBadge");
+    bd.textContent = n ? "●" : "";
+    bd.style.display = n ? "inline-block" : "none";
+    if (S.view === "rec") renderRec();
+    clearTimeout(REC.timer);
+    REC.timer = setTimeout(recFetch, S.view === "rec" ? 3e3 : 6e4);
+  });
+}
+function renderRec(force) {
+  const box = $("#recBox"), b = recBase();
+  const sig = REC.ok + "|" + b + "|" + REC.items.map((x) => x.id + x.status + (x.exists ? 1 : 0)).join(",");
+  if (!force && sig === REC.sig) {
+    REC.items.forEach((d) => {
+      const r = box.querySelector(`.dlRow[data-id="${d.id}"] .dlSt`);
+      if (r) r.textContent = recTxt(d);
+    });
+    return;
+  }
+  REC.sig = sig;
+  if (b == null) {
+    box.innerHTML = `<h3>Gravações</h3><p>Quem grava é o <b>computador</b>: ele precisa estar ligado com o Berga TV aberto pelo atalho <b>“Berga TV (rede Wi-Fi)”</b>. A TV e o celular podem ficar desligados.</p><p class="muted">Para agendar por aqui, informe em ⚙ Configurações o endereço que aparece na janela preta do computador (ex.: 192.168.1.24:8765).</p><button class="btn pri" data-r="cfg">Abrir configurações</button>`;
+    return;
+  }
+  if (REC.ok === false) {
+    box.innerHTML = `<h3>Gravações</h3><p class="dlSt err">Não consegui falar com o computador${b ? " (" + esc(b) + ")" : ""}. Ele está ligado e com o Berga TV aberto${AND || WEBOS ? " pelo atalho “rede Wi-Fi”" : ""}?</p><button class="btn" data-r="retry">Tentar de novo</button>${AND || WEBOS ? ' <button class="btn" data-r="cfg">Alterar endereço</button>' : ""}`;
+    return;
+  }
+  const sch = REC.items.filter((x) => x.status === "agendado").sort((a, c) => a.start - c.start), run = REC.items.filter((x) => x.status === "gravando" || x.status === "parado"), done = REC.items.filter((x) => x.status === "concluido" || x.status === "erro").sort((a, c) => (c.finished || c.end) - (a.finished || a.end));
+  const row = (d) => `<div class="dlRow" data-id="${d.id}"><img ${d.logo ? `src="${esc(d.logo)}"` : ""} alt=""><div class="dlMain"><b>${esc(d.name)}</b><div class="dlSt${d.status === "erro" ? " err" : ""}">${esc(recTxt(d))}</div></div><div class="dlBtns">${d.status === "agendado" ? `<button class="btn sm danger" data-r="stop" data-id="${d.id}">Cancelar</button>` : d.status === "gravando" ? `<button class="btn sm danger" data-r="stop" data-id="${d.id}">⏹ Parar</button>` : (d.exists ? `<button class="btn sm pri" data-r="play" data-id="${d.id}">▶ Assistir</button>` : "") + `<button class="btn sm danger" data-r="delete" data-id="${d.id}">Apagar</button>`}</div></div>`;
+  box.innerHTML = `<p class="muted small" style="margin:0 2px 14px">Agende pelo <b>Guia</b> ou pela lista “A seguir” do canal. Quem grava é o computador${b ? " (" + esc(b) + ")" : ""}: ele precisa estar ligado na hora do programa. Cada gravação usa uma conexão do seu plano enquanto grava.</p>` + (run.length ? "<h3>Gravando agora</h3>" + run.map(row).join("") : "") + (sch.length ? "<h3>Agendadas</h3>" + sch.map(row).join("") : "") + (done.length ? "<h3>Gravadas</h3>" + done.map(row).join("") : "") + (!REC.items.length ? '<p class="muted">Nenhuma gravação ainda. Abra o <b>Guia</b>, escolha um programa e toque em <b>⏺ Gravar</b>.</p>' : "");
+}
+function recTxt(d) {
+  const dt = (t) => dayLbl(t) + " " + hhmm(t);
+  if (d.status === "agendado") return `${dt(d.start)} – ${hhmm(d.end)} · agendada`;
+  if (d.status === "gravando") return `● Gravando até ${hhmm(d.end)} · ${fmtB(d.done)}${d.msg ? " · " + d.msg : ""}`;
+  if (d.status === "parado") return "Finalizando…";
+  if (d.status === "erro") return "Não gravou: " + (d.msg || "erro");
+  return `${dt(d.start)} · ${fmtB(d.total || d.done)}${d.msg ? " · " + d.msg : ""}${d.exists ? "" : " · arquivo não encontrado"}`;
+}
+$("#recBox").onclick = (e) => __async(this, null, function* () {
+  const b = e.target.closest("[data-r]");
+  if (!b) return;
+  const a = b.dataset.r, id = b.dataset.id, d = REC.items.find((x) => x.id === id);
+  if (a === "cfg") {
+    openSettings();
+    setTimeout(() => {
+      const i = document.querySelector("#cfgForm [name=pcAddr]");
+      i && (i.scrollIntoView({ block: "center" }), i.focus());
+    }, 60);
+    return;
+  }
+  if (a === "retry") {
+    REC.sig = "";
+    recFetch();
+    return;
+  }
+  if (a === "play" && d) {
+    const base = recBase() || "";
+    const url = base ? base + "/dl/file/" + d.id + d.ext : "/dl/file/" + d.id + d.ext;
+    playVod({ k: "rec|" + d.id, name: d.name, logo: d.logo, url });
+    return;
+  }
+  if (a === "delete" && !confirm('Apagar a gravação "' + (d ? d.name : "") + '" do computador?')) return;
+  try {
+    b.disabled = true;
+    yield recPost("/dl/act", { id, act: a });
+    REC.sig = "";
+    yield recFetch();
+  } catch (err) {
+    toast("Erro: " + err.message, true);
+  }
+});
 const OSKON = WEBOS || TVBROWSER;
 const OSK = { el: null, target: null, shift: false };
 const oskOpen = () => !$("#osk").classList.contains("hidden");
@@ -3368,8 +3884,9 @@ function webosUpdCheck() {
   });
 }
 (function init() {
-  setView(["live", "guide", "movie", "series", "multi", "fav", "dl"].includes(S.view) && !(WEBOS && ["multi", "dl"].includes(S.view)) ? S.view : "live");
+  setView(["live", "guide", "movie", "series", "multi", "fav", "dl", "rec"].includes(S.view) && !(WEBOS && ["multi", "dl"].includes(S.view)) ? S.view : "live");
   dlFetch();
+  recFetch();
   if (!window.Hls || !window.mpegts) toast("Não consegui carregar os componentes de vídeo (precisa de internet). Alguns canais podem não abrir.", true);
   window.__bergaOk = true;
   loadActive(false);
