@@ -909,6 +909,7 @@ nav button.on .badge{background:#fff;color:var(--ac)}
 .tv .card:focus{outline:none!important}.tv .card:focus .poster{box-shadow:0 0 0 3px var(--ac);transform:scale(1.04)}
 .tv .ch:focus,.tv .cat:focus,.tv .epi:focus,.tv .gRow:focus .gName{background:rgba(255,90,31,.22)}
 .android .search input{font-size:16px}
+html.webos #nav [data-view=dl],html.webos #nav [data-view=multi],html.webos [data-a=dl],html.webos .dlb,html.webos [data-a=dlseason],html.webos [data-a=pip],html.webos [data-m=pip]{display:none!important}
 @media (max-width:900px){
  .top{height:auto;flex-wrap:wrap;padding:8px 10px;gap:8px}
  .brand span:last-child{display:none}
@@ -1048,7 +1049,8 @@ var __async = (__this, __arguments, generator) => {
   });
 };
 const AND = window.BergaAndroid || null;
-const TVBROWSER = !AND && /web0s|webos|netcast|tizen|smart-?tv|hbbtv/i.test(navigator.userAgent);
+const WEBOS = window.BERGA_PLATFORM === "webos";
+const TVBROWSER = !AND && (WEBOS || /web0s|webos|netcast|tizen|smart-?tv|hbbtv/i.test(navigator.userAgent));
 const TV = !!(AND && AND.isTV && AND.isTV()) || TVBROWSER;
 const $ = (s) => document.querySelector(s);
 const enc = encodeURIComponent;
@@ -1145,9 +1147,19 @@ const S = {
   guideCat: null
 };
 const uaQ = () => S.cfg.ua ? "&ua=" + enc(S.cfg.ua) : "";
-const px = (u) => "/p?u=" + enc(u) + uaQ();
+const px = (u) => WEBOS ? u : "/p?u=" + enc(u) + uaQ();
 function txt(u) {
   return __async(this, null, function* () {
+    if (WEBOS) {
+      let r2;
+      try {
+        r2 = yield fetch(u, { cache: "no-store" });
+      } catch (e) {
+        throw new Error("não foi possível conectar ao provedor");
+      }
+      if (!r2.ok) throw new Error("o provedor respondeu HTTP " + r2.status);
+      return r2.text();
+    }
     const r = yield fetch("/t?u=" + enc(u) + uaQ());
     const t = yield r.text();
     if (!r.ok) {
@@ -1291,7 +1303,24 @@ function playStream(_0, _1) {
     stopVideo(v);
     const tok = v._tok;
     const fail = (m) => {
-      if (v._tok === tok && o.onErr) o.onErr(m);
+      if (v._tok !== tok) return;
+      if (WEBOS && !o.native && url[0] !== "/") {
+        o.native = true;
+        const e = engines.get(v);
+        if (e) {
+          try {
+            e.destroy();
+          } catch (_) {
+          }
+          engines.delete(v);
+        }
+        v.src = url;
+        const pl2 = v.play();
+        pl2 && pl2.catch && pl2.catch(() => {
+        });
+        return;
+      }
+      if (o.onErr) o.onErr(m);
     };
     const local = url[0] === "/";
     let kind = kindOf(url);
@@ -1529,6 +1558,132 @@ function loadActive(force) {
     loadEPG(src, false);
   });
 }
+const ENT = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+const unent = (t) => t.replace(/&(#x?[0-9a-f]+|\w+);/gi, (m, c) => c[0] === "#" ? String.fromCharCode(c[1] === "x" || c[1] === "X" ? parseInt(c.slice(2), 16) : +c.slice(1)) : ENT[c.toLowerCase()] || m);
+function xtTime(s) {
+  s = String(s || "").trim();
+  const t = Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8), +s.slice(8, 10), +s.slice(10, 12), +s.slice(12, 14) || 0) / 1e3;
+  const m = s.slice(14).trim().match(/^([+-])(\d\d)(\d\d)/);
+  if (!m) return t;
+  const off = +m[2] * 3600 + +m[3] * 60;
+  return m[1] === "+" ? t - off : t + off;
+}
+function epgLocal(url, force) {
+  return __async(this, null, function* () {
+    const key = "epg:" + url;
+    let c = null;
+    try {
+      c = yield idb.get(key);
+    } catch (e) {
+    }
+    if (!force && c && Date.now() - c.at < 4 * 36e5) return c.data;
+    let r;
+    try {
+      r = yield fetch(url, { cache: "no-store" });
+    } catch (e) {
+      if (c) return c.data;
+      throw e;
+    }
+    if (!r.ok) {
+      if (c) return c.data;
+      throw new Error("HTTP " + r.status);
+    }
+    const now = Date.now() / 1e3, lo = now - 7200, hi = now + 72e3, names = {}, progs = {};
+    const dec = new TextDecoder("utf-8");
+    let buf = "", inf = null, first = true;
+    const attrs = (h) => {
+      const a = {};
+      h.replace(/([\w-]+)\s*=\s*"([^"]*)"/g, (_, k, v) => {
+        a[k] = v;
+      });
+      return a;
+    };
+    const tag = (b, n) => {
+      const m = b.match(new RegExp("<" + n + "[^>]*>([\\s\\S]*?)</" + n + ">"));
+      return m ? unent(m[1].replace(/<!\[CDATA\[|\]\]>/g, "")).trim() : "";
+    };
+    const putName = (raw, id) => {
+      const k = norm(raw);
+      if (k && !(k in names)) names[k] = id;
+    };
+    const eat = () => {
+      let i = 0;
+      for (; ; ) {
+        const a = buf.indexOf("<channel", i), b = buf.indexOf("<programme", i);
+        if (a < 0 && b < 0) {
+          i = Math.max(i, buf.length - 20);
+          break;
+        }
+        const isP = b >= 0 && (a < 0 || b < a), st = isP ? b : a, endTag = isP ? "</programme>" : "</channel>";
+        let e = buf.indexOf(endTag, st), gt = buf.indexOf(">", st);
+        if (gt < 0) break;
+        let el;
+        if (buf[gt - 1] === "/") {
+          el = buf.slice(st, gt + 1);
+          i = gt + 1;
+        } else {
+          if (e < 0) {
+            i = st;
+            break;
+          }
+          el = buf.slice(st, e + endTag.length);
+          i = e + endTag.length;
+        }
+        const at = attrs(el.slice(0, el.indexOf(">")));
+        if (!isP) {
+          const id = at.id;
+          if (id) {
+            putName(id, id);
+            el.replace(/<display-name[^>]*>([\s\S]*?)<\/display-name>/g, (_, n) => {
+              putName(unent(n), id);
+            });
+          }
+        } else {
+          let s0, e0;
+          try {
+            s0 = xtTime(at.start);
+            e0 = at.stop ? xtTime(at.stop) : s0 + 3600;
+          } catch (x) {
+            continue;
+          }
+          if (at.channel && s0 && e0 >= lo && s0 <= hi) {
+            let d = tag(el, "desc");
+            if (d.length > 180) d = d.slice(0, 177).trim() + "...";
+            (progs[at.channel] || (progs[at.channel] = [])).push([s0, e0, tag(el, "title"), d]);
+          }
+        }
+      }
+      buf = buf.slice(i);
+    };
+    const push = (chunk) => {
+      buf += dec.decode(chunk, { stream: true });
+      if (buf.length > 65536) eat();
+    };
+    const rd = r.body.getReader();
+    for (; ; ) {
+      const { done, value } = yield rd.read();
+      if (done) break;
+      if (first) {
+        first = false;
+        if (value[0] === 31 && value[1] === 139) {
+          if (!window.pako) throw new Error("guia compactado sem suporte");
+          inf = new pako.Inflate();
+          inf.onData = push;
+        }
+      }
+      if (inf) inf.push(value, false);
+      else push(value);
+    }
+    if (inf) inf.push(new Uint8Array(0), true);
+    buf += dec.decode();
+    eat();
+    for (const k in progs) progs[k].sort((a, b) => a[0] - b[0]);
+    const data = { gerado: Math.floor(now), progs, names };
+    idb.set(key, { at: Date.now(), data }).catch(() => {
+    });
+    return data;
+  });
+}
 function loadEPG(src, force) {
   return __async(this, null, function* () {
     const u = (src.epg || "").trim() || S.epgHint;
@@ -1537,9 +1692,13 @@ function loadEPG(src, force) {
     const before = $("#status").textContent;
     status("Carregando guia de programação…", true);
     try {
-      const r = yield fetch("/epg?u=" + enc(u) + uaQ() + (force ? "&force=1" : ""));
-      const j = yield r.json();
-      if (!r.ok) throw new Error(j.erro || "HTTP " + r.status);
+      let j;
+      if (WEBOS) j = yield epgLocal(u, force);
+      else {
+        const r = yield fetch("/epg?u=" + enc(u) + uaQ() + (force ? "&force=1" : ""));
+        j = yield r.json();
+        if (!r.ok) throw new Error(j.erro || "HTTP " + r.status);
+      }
       if (tok !== S.epgLoad) return;
       S.epg = j;
       S.epgTok++;
@@ -2031,6 +2190,7 @@ const dlDone = (k) => {
 };
 function dlFetch() {
   return __async(this, null, function* () {
+    if (WEBOS) return;
     try {
       let j;
       if (AND) j = JSON.parse(AND.post("/dl/list", "{}"));
@@ -2388,15 +2548,16 @@ function openSettings(edit) {
     <div class="mBtns"><button class="btn pri" type="submit">${e ? "Salvar alterações" : "Salvar e carregar"}</button>${e ? '<button class="btn" type="button" data-cancel>Cancelar</button>' : ""}</div>
   </form>
   ${AND ? `<h3>Atualização</h3><div class="pub"><div><b>Berga TV ${esc(appVer().name)}</b><div class="muted small" id="updSt">${UPD.info && !UPD.info.erro ? UPD.info.latest > UPD.info.current ? "Nova versão " + esc(UPD.info.name) + " disponível." : "Você está na versão mais recente." : "Toque para verificar se há versão nova."}</div></div><button class="btn sm" type="button" data-upd>Verificar atualização</button></div>` : ""}
+  ${WEBOS ? `<h3>TV LG</h3><div class="pub"><div><b>Berga TV ${esc(window.BERGA_VERSION || "")}</b><div class="muted small">Modo desenvolvedor renovado há ${Math.floor((Date.now() - LS.get("devRenewAt", Date.now())) / 864e5)} dias (vence com 41). Renove no Dev Manager → Info → Renew session.</div></div><button class="btn sm" type="button" data-devok>Acabei de renovar</button></div>` : ""}
   <h3>Preferências</h3>
   <form id="cfgForm">
     <div class="row2"><label>Formato dos canais ao vivo (Xtream)<select name="fmt"><option value="auto">Automático</option><option value="m3u8">HLS (.m3u8)</option><option value="ts">MPEG-TS (.ts)</option></select></label>
     <label>User-Agent enviado ao provedor<input name="ua" value="${esc(S.cfg.ua)}" placeholder="Padrão: VLC"></label></div>
-    ${AND ? "" : `<div class="row2"><label>Pasta dos downloads<input name="dldir" value="${esc(DLS.dir)}"></label><label>Downloads ao mesmo tempo<select name="dlmax">${[1, 2, 3, 4].map((n) => `<option value="${n}" ${+DLS.max === n ? "selected" : ""}>${n}</option>`).join("")}</select></label></div>`}
+    ${AND || WEBOS ? "" : `<div class="row2"><label>Pasta dos downloads<input name="dldir" value="${esc(DLS.dir)}"></label><label>Downloads ao mesmo tempo<select name="dlmax">${[1, 2, 3, 4].map((n) => `<option value="${n}" ${+DLS.max === n ? "selected" : ""}>${n}</option>`).join("")}</select></label></div>`}
     <label class="chk"><input type="checkbox" name="hideAdult" ${S.cfg.hideAdult ? "checked" : ""}> Ocultar categorias adultas</label>
     <div class="mBtns"><button class="btn" type="submit">Salvar preferências</button><button class="btn" type="button" data-epg>Recarregar guia (EPG)</button></div>
   </form>
-  ${AND ? "" : `<p class="muted small" style="margin-top:18px">Dica: para abrir na TV ou em outro aparelho da mesma rede Wi-Fi, rode <b>python berga_tv.py --lan</b> e acesse o endereço que aparece na janela.</p>`}`);
+  ${AND || WEBOS ? "" : `<p class="muted small" style="margin-top:18px">Dica: para abrir na TV ou em outro aparelho da mesma rede Wi-Fi, rode <b>python berga_tv.py --lan</b> e acesse o endereço que aparece na janela.</p>`}`);
   $("#cfgForm").fmt.value = S.cfg.fmt;
   const card2 = $("#modalCard");
   card2.onclick = (ev) => __async(this, null, function* () {
@@ -2433,6 +2594,12 @@ function openSettings(edit) {
         closeModal();
         loadEPG(S.src, true);
       }
+      return;
+    }
+    if (d.devok !== void 0) {
+      LS.set("devRenewAt", Date.now());
+      toast("Anotado. Aviso de novo daqui a 30 dias.");
+      openSettings();
       return;
     }
     if (d.upd !== void 0) {
@@ -2891,6 +3058,17 @@ window.bergaBack = function() {
     }, 50);
     return true;
   }
+  if (WEBOS) {
+    try {
+      if (window.PalmSystem && PalmSystem.platformBack) {
+        PalmSystem.platformBack();
+        return true;
+      }
+    } catch (e) {
+    }
+    window.close();
+    return true;
+  }
   return false;
 };
 window.bergaAppPause = function() {
@@ -2957,6 +3135,7 @@ function spatial(dir) {
 }
 if (TV) document.documentElement.classList.add("tv");
 if (AND) document.documentElement.classList.add("android");
+if (WEBOS) document.documentElement.classList.add("webos");
 const UPD = { manual: false, info: null };
 function appVer() {
   try {
@@ -3045,8 +3224,53 @@ window.onUpdateProgress = function(j) {
   if (bar && j.pct >= 0) bar.style.width = j.pct + "%";
   if (m) m.textContent = j.pct >= 0 ? `Baixando… ${j.pct}%` : "Baixando…";
 };
+function devModeReminder() {
+  const now = Date.now(), D = 864e5;
+  let last = LS.get("devRenewAt", 0);
+  if (!last) {
+    LS.set("devRenewAt", now);
+    return;
+  }
+  if (now - last < 30 * D || now < LS.get("devRemindAt", 0) || !$("#modal").classList.contains("hidden")) return;
+  const left = Math.max(0, 41 - Math.floor((now - last) / D));
+  S.modalFor = "devmode";
+  modal(`<button class="mx" data-close>✕</button><h2>Renove o modo desenvolvedor</h2><p>O modo desenvolvedor desta TV vence em <b>cerca de ${left} dias</b>. Se vencer, o Berga TV é removido da TV e precisa ser instalado de novo.</p><p class="muted">Para renovar (leva 10 segundos): no computador, abra o <b>webOS Dev Manager</b> → aba <b>Info</b> → <b>Renew session</b>. Ou, na TV, abra o app <b>Developer Mode</b> e clique em <b>Extend</b>.</p><div class="mBtns"><button class="btn pri" data-dm="ok">Já renovei</button><button class="btn" data-dm="later">Lembrar em 3 dias</button></div>`);
+  $("#modalCard").onclick = (e) => {
+    const b = e.target.closest("[data-dm]");
+    if (!b) return;
+    if (b.dataset.dm === "ok") {
+      LS.set("devRenewAt", Date.now());
+      toast("Ótimo! Aviso de novo daqui a 30 dias.");
+    } else LS.set("devRemindAt", Date.now() + 3 * D);
+    closeModal();
+  };
+  setTimeout(() => {
+    const b = document.querySelector("[data-dm=ok]");
+    b && b.focus();
+  }, 60);
+}
+function webosUpdCheck() {
+  fetch("https://api.github.com/repos/rodrigobergaa/berga-tv-app/releases/latest").then((r) => r.json()).then((j) => {
+    LS.set("updAt", Date.now());
+    const cur = +String(window.BERGA_VERSION || "0").split(".").pop(), tag = String(j.tag_name || ""), lat = +tag.split(".").pop();
+    if (!(lat > cur) || LS.get("updSkip", 0) === lat) return;
+    S.modalFor = "upd";
+    modal(`<button class="mx" data-close>✕</button><h2>Nova versão disponível</h2><p class="muted">Berga TV ${esc(tag.replace(/^v/, ""))} (esta TV está na ${esc(window.BERGA_VERSION || "?")}).</p><p>Para atualizar, abra o <b>webOS Dev Manager</b> no computador e instale o arquivo <b>BergaTV.ipk</b> novo por cima. Suas listas e favoritos continuam.</p><div class="mBtns"><button class="btn pri" data-close>Ok</button><button class="btn" data-skip>Não avisar desta versão</button></div>`);
+    $("#modalCard").onclick = (e) => {
+      if (e.target.closest("[data-skip]")) {
+        LS.set("updSkip", lat);
+        closeModal();
+      }
+    };
+    setTimeout(() => {
+      const b = document.querySelector("#modalCard .btn.pri");
+      b && b.focus();
+    }, 60);
+  }).catch(() => {
+  });
+}
 (function init() {
-  setView(["live", "guide", "movie", "series", "multi", "fav", "dl"].includes(S.view) ? S.view : "live");
+  setView(["live", "guide", "movie", "series", "multi", "fav", "dl"].includes(S.view) && !(WEBOS && ["multi", "dl"].includes(S.view)) ? S.view : "live");
   dlFetch();
   if (!window.Hls || !window.mpegts) toast("Não consegui carregar os componentes de vídeo (precisa de internet). Alguns canais podem não abrir.", true);
   window.__bergaOk = true;
@@ -3056,6 +3280,8 @@ window.onUpdateProgress = function(j) {
     b && b.focus();
   }, 400);
   if (AND && Date.now() - LS.get("updAt", 0) > 6 * 36e5) setTimeout(() => updCheck(false), 5e3);
+  if (WEBOS && Date.now() - LS.get("updAt", 0) > 6 * 36e5) setTimeout(webosUpdCheck, 8e3);
+  if (WEBOS) setTimeout(devModeReminder, 3e3);
 })();
 </script>
 </body>
