@@ -1,1 +1,1 @@
-Primeira versão do Berga TV para Android e TV: player nativo, troca de canal pelo controle, janela flutuante, downloads e atualização automática.
+Compatível com TVs e TV Boxes com navegador antigo; navegação pelo controle da LG.
