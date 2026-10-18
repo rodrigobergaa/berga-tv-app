@@ -3,7 +3,7 @@ name: Publicar versão
 on:
   push:
     branches: [main]
-    paths: [BergaTV.apk, versao.txt]
+    paths: [BergaTV.apk, BergaTV.ipk, versao.txt]
   workflow_dispatch: {}
 
 permissions:
@@ -25,4 +25,5 @@ jobs:
           make_latest: true
           files: |
             BergaTV.apk
+            BergaTV.ipk
             berga_tv.py
