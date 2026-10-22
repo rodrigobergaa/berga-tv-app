@@ -2572,7 +2572,7 @@ function playLive(it, delay) {
   document.querySelectorAll("#liveList .ch").forEach((e) => {
     const on = e._it === it;
     e.classList.toggle("on", on);
-    if (on && delay !== void 0) e.scrollIntoView({ block: "nearest" });
+    if (on && delay !== void 0) intoView(e);
   });
   renderLiveInfo();
   clearTimeout(zapT);
@@ -3247,12 +3247,25 @@ document.addEventListener("keydown", (e) => {
     }
   }
   if (TV && (e.key === "ArrowRight" || e.key === "ArrowLeft") && e.target.matches && e.target.matches(".cat") && e.key === "ArrowRight") {
-    const t = S.view, box = t === "live" ? $("#liveList") : $("#" + t + "Grid"), tg = box && (box.querySelector(".ch.on") || box.querySelector(".ch,.card"));
-    if (tg) {
-      e.preventDefault();
-      tg.focus({ preventScroll: true });
-      tg.scrollIntoView({ block: "nearest" });
-      return;
+    const t = S.view, box = t === "live" ? $("#liveList") : $("#" + t + "Grid");
+    if (box) {
+      const cr = e.target.getBoundingClientRect(), cy = cr.top + cr.height / 2, br = box.getBoundingClientRect();
+      let best = null, bd = 1e9;
+      box.querySelectorAll(".ch,.card").forEach((x) => {
+        const r = x.getBoundingClientRect();
+        if (r.bottom < br.top + 4 || r.top > br.bottom - 4 || r.height === 0) return;
+        const d = Math.abs(r.top + r.height / 2 - cy) + Math.abs(r.left - br.left) * 0.2;
+        if (d < bd) {
+          bd = d;
+          best = x;
+        }
+      });
+      best = best || box.querySelector(".ch.on") || box.querySelector(".ch,.card");
+      if (best) {
+        e.preventDefault();
+        focusTo(best);
+        return;
+      }
     }
   }
   if (TV && e.key === "ArrowLeft" && e.target.matches && e.target.matches("#liveList .ch,#movieGrid .card,#seriesGrid .card")) {
@@ -3261,8 +3274,7 @@ document.addEventListener("keydown", (e) => {
       const c = document.querySelector("#" + S.view + "Cats .cat.on");
       if (c) {
         e.preventDefault();
-        c.focus({ preventScroll: true });
-        c.scrollIntoView({ block: "nearest" });
+        focusTo(c);
         return;
       }
     }
@@ -3348,10 +3360,7 @@ function pfsExit() {
   $("#pfsInfo").classList.remove("on");
   setTimeout(() => {
     const r = document.querySelector("#liveList .ch.on");
-    if (r) {
-      r.focus();
-      r.scrollIntoView({ block: "nearest" });
-    }
+    if (r) focusTo(r);
   }, 30);
 }
 function liveFull(pipMode) {
@@ -3497,8 +3506,8 @@ function spatial(dir) {
   if (!cur || !els.includes(cur)) {
     const f = els.find((e) => e.matches(".ch.on")) || els.find((e) => e.matches("#nav .on")) || els[0];
     if (f) {
-      f.focus();
-      f.scrollIntoView({ block: "nearest" });
+      focusTo(f);
+      if (0) f.scrollIntoView({ block: "nearest" });
     }
     return;
   }
@@ -3531,10 +3540,7 @@ function spatial(dir) {
       best = e;
     }
   }
-  if (best) {
-    best.focus({ preventScroll: true });
-    best.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }
+  if (best) focusTo(best);
 }
 if (TV) document.documentElement.classList.add("tv");
 if (AND) document.documentElement.classList.add("android");
@@ -3800,6 +3806,52 @@ $("#recBox").onclick = (e) => __async(this, null, function* () {
     toast("Erro: " + err.message, true);
   }
 });
+function scrollParents(el) {
+  const a = [];
+  let p = el.parentElement;
+  while (p && p !== document.body && p !== document.documentElement) {
+    const cs = getComputedStyle(p);
+    if (/(auto|scroll)/.test(cs.overflowY + " " + cs.overflowX) && (p.scrollHeight > p.clientHeight + 1 || p.scrollWidth > p.clientWidth + 1)) a.push(p);
+    p = p.parentElement;
+  }
+  return a;
+}
+function intoView(el) {
+  if (!el) return;
+  const m = 10;
+  scrollParents(el).forEach((p) => {
+    const r = el.getBoundingClientRect(), c = p.getBoundingClientRect();
+    let top = c.top, left = c.left;
+    if (p.id === "guide") {
+      const hd = p.querySelector(".gHead");
+      top += hd ? hd.offsetHeight : 0;
+      if (!el.matches(".gName")) {
+        const gn = p.querySelector(".gName");
+        left += gn ? gn.offsetWidth : 0;
+      }
+    }
+    if (r.top < top + m) p.scrollTop -= top + m - r.top;
+    else if (r.bottom > c.bottom - m) p.scrollTop += r.bottom - (c.bottom - m);
+    if (r.left < left + m) p.scrollLeft -= left + m - r.left;
+    else if (r.right > c.right - m) p.scrollLeft += r.right - (c.right - m);
+  });
+}
+function focusTo(el) {
+  if (!el) return;
+  const ps = scrollParents(el), pos = ps.map((p) => [p.scrollTop, p.scrollLeft]);
+  try {
+    el.focus({ preventScroll: true });
+  } catch (e) {
+    el.focus();
+  }
+  ps.forEach((p, i) => {
+    p.scrollTop = pos[i][0];
+    p.scrollLeft = pos[i][1];
+  });
+  const w = window.scrollY;
+  if (w) window.scrollTo(0, 0);
+  intoView(el);
+}
 const OSKON = WEBOS || TVBROWSER;
 const OSK = { el: null, target: null, shift: false };
 const oskOpen = () => !$("#osk").classList.contains("hidden");

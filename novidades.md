@@ -1,1 +1,1 @@
-TV: tela cheia sem tela preta, clique de novo no canal para tela cheia, → vai direto aos canais, Voltar não fecha o app sem querer.
+TV: a seleção anda pela tela ao usar ↑↓ e a lista só rola na borda; → na categoria vai ao canal ao lado.
