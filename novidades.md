@@ -1,1 +1,1 @@
-Histórico dos últimos 15 canais e botão Anterior. Inclui favoritos Fran/Berga, Ao vivo, programas anteriores e gravações.
+TV: tela cheia sem tela preta, clique de novo no canal para tela cheia, → vai direto aos canais, Voltar não fecha o app sem querer.

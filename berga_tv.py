@@ -1093,6 +1093,10 @@ nav button.on .badge{background:#fff;color:var(--ac)}
 .tv .ch:focus,.tv .cat:focus,.tv .epi:focus,.tv .gRow:focus .gName{background:rgba(255,90,31,.22)}
 .android .search input{font-size:16px}
 html.webos #nav [data-view=dl],html.webos #nav [data-view=multi],html.webos [data-a=dl],html.webos .dlb,html.webos [data-a=dlseason],html.webos [data-a=pip],html.webos [data-m=pip]{display:none!important}
+#liveWrap.pfs{position:fixed!important;top:0;left:0;right:0;bottom:0;width:100%!important;height:100%!important;max-height:none!important;padding:0!important;border-radius:0!important;z-index:85;background:#000}
+#liveWrap.pfs video{position:absolute;top:0;left:0;width:100%;height:100%}
+#pfsInfo{position:fixed;left:40px;top:30px;z-index:86;background:#0c0e13dd;border-left:4px solid var(--ac);border-radius:8px;padding:12px 18px;max-width:60%;display:none}
+#pfsInfo.on{display:block}#pfsInfo b{display:block;font-size:22px}#pfsInfo span{color:var(--tx2);font-size:15px}#pfsInfo small{display:block;color:var(--tx2);margin-top:6px;font-size:12px}
 #osk{position:fixed;left:0;right:0;bottom:0;z-index:95;background:var(--bg2);border-top:2px solid var(--ac);padding:14px 18px 18px;box-shadow:0 -10px 40px #000c}
 #osk.hidden{display:none}
 .oskTop{display:flex;align-items:center;margin-bottom:10px}
@@ -1192,6 +1196,7 @@ html.webos #nav [data-view=dl],html.webos #nav [data-view=multi],html.webos [dat
 </div>
 <div id="mini" class="mini"><div class="miniBar" id="miniBar"><span id="miniName"></span><button data-m="live" title="Voltar ao vivo">⟳</button><button data-m="pip" title="Janela flutuante fora do navegador (Picture-in-Picture)">⧉</button><button data-m="back" title="Voltar para o canal">⤢</button><button data-m="close" title="Parar e fechar">✕</button></div><div id="miniSlot"></div></div>
 <div id="osk" class="hidden"></div>
+<div id="pfsInfo"></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -2212,6 +2217,7 @@ function renderAll() {
   placePlayer();
 }
 function setView(v) {
+  if (v !== "live" && pfsOn()) pfsExit();
   const prev = S.view;
   S.view = v;
   LS.set("view", v);
@@ -3061,7 +3067,10 @@ $("#liveEpg").onclick = (e) => {
 };
 $("#liveVideo").addEventListener("dblclick", (e) => {
   e.preventDefault();
-  liveFull();
+  if (!TV) liveFull();
+});
+$("#liveWrap").addEventListener("click", () => {
+  if (pfsOn()) pfsInfo();
 });
 $("#guideCat").onchange = (e) => {
   S.guideCat = e.target.value;
@@ -3217,6 +3226,47 @@ document.addEventListener("keydown", (e) => {
     oskShow(e.target);
     return;
   }
+  if (pfsOn()) {
+    const k = e.key;
+    if (k === "ArrowUp" || k === "ArrowDown" || k === "PageUp" || k === "PageDown" || k === "ChannelUp" || k === "ChannelDown") {
+      e.preventDefault();
+      zap(k === "ArrowUp" || k === "PageUp" || k === "ChannelDown" ? -1 : 1);
+      setTimeout(pfsInfo, 60);
+      return;
+    }
+    if (k === "Enter") {
+      e.preventDefault();
+      if ($("#pfsInfo").classList.contains("on")) goLive();
+      pfsInfo();
+      return;
+    }
+    if (/^Arrow/.test(k)) {
+      e.preventDefault();
+      pfsInfo();
+      return;
+    }
+  }
+  if (TV && (e.key === "ArrowRight" || e.key === "ArrowLeft") && e.target.matches && e.target.matches(".cat") && e.key === "ArrowRight") {
+    const t = S.view, box = t === "live" ? $("#liveList") : $("#" + t + "Grid"), tg = box && (box.querySelector(".ch.on") || box.querySelector(".ch,.card"));
+    if (tg) {
+      e.preventDefault();
+      tg.focus({ preventScroll: true });
+      tg.scrollIntoView({ block: "nearest" });
+      return;
+    }
+  }
+  if (TV && e.key === "ArrowLeft" && e.target.matches && e.target.matches("#liveList .ch,#movieGrid .card,#seriesGrid .card")) {
+    const col = e.target.matches(".card") ? e.target.getBoundingClientRect().left < e.target.parentElement.getBoundingClientRect().left + 20 : true;
+    if (col) {
+      const c = document.querySelector("#" + S.view + "Cats .cat.on");
+      if (c) {
+        e.preventDefault();
+        c.focus({ preventScroll: true });
+        c.scrollIntoView({ block: "nearest" });
+        return;
+      }
+    }
+  }
   if (TV && /^Arrow/.test(e.key) && !(e.target.tagName === "SELECT")) {
     if (typing && (e.key === "ArrowLeft" || e.key === "ArrowRight")) return;
     e.preventDefault();
@@ -3277,9 +3327,39 @@ setInterval(() => {
   refreshNow();
   if (S.view === "live") renderLiveInfo();
 }, 3e4);
+const pfsOn = () => $("#liveWrap").classList.contains("pfs");
+let pfsT;
+function pfsInfo() {
+  const it = S.cur, e = $("#pfsInfo");
+  if (!it || !pfsOn()) return;
+  const p = nowProg(it);
+  e.innerHTML = `<b>${esc(it.num ? it.num + "  " : "")}${esc(it.name)}</b>${p ? `<span>${hhmm(p[0])} – ${hhmm(p[1])} · ${esc(p[2])}</span>` : ""}<small>↑ ↓ trocar canal · OK ao vivo · Voltar sai da tela cheia</small>`;
+  e.classList.add("on");
+  clearTimeout(pfsT);
+  pfsT = setTimeout(() => e.classList.remove("on"), 4e3);
+}
+function pfsEnter() {
+  if (S.view !== "live") setView("live");
+  $("#liveWrap").classList.add("pfs");
+  pfsInfo();
+}
+function pfsExit() {
+  $("#liveWrap").classList.remove("pfs");
+  $("#pfsInfo").classList.remove("on");
+  setTimeout(() => {
+    const r = document.querySelector("#liveList .ch.on");
+    if (r) {
+      r.focus();
+      r.scrollIntoView({ block: "nearest" });
+    }
+  }, 30);
+}
 function liveFull(pipMode) {
   if (!S.cur) return;
-  if (!AND) return fs($("#liveWrap"));
+  if (!AND) {
+    if (TV) return pfsOn() ? pfsExit() : pfsEnter();
+    return fs($("#liveWrap"));
+  }
   const list = itemsOf("live");
   let i = list.indexOf(S.cur), L = list;
   if (i < 0) {
@@ -3342,6 +3422,10 @@ window.bergaBack = function() {
     oskClose(false);
     return true;
   }
+  if (pfsOn()) {
+    pfsExit();
+    return true;
+  }
   if (document.fullscreenElement) {
     document.exitFullscreen().catch(() => {
     });
@@ -3370,6 +3454,11 @@ window.bergaBack = function() {
       const b = $("#nav [data-view=live]");
       b && b.focus();
     }, 50);
+    return true;
+  }
+  if (TV && Date.now() - (S.backAt || 0) > 2500) {
+    S.backAt = Date.now();
+    toast("Aperte Voltar de novo para sair do Berga TV");
     return true;
   }
   if (WEBOS) {
